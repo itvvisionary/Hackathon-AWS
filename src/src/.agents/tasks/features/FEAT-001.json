@@ -1,0 +1,24 @@
+{
+  "id": "FEAT-001",
+  "type": "feat",
+  "description": "Foundation layer: env-driven DynamoDB access for the four tables (data.py), the custom LangGraph DynamoDB checkpointer (checkpointer.py), and a thin re-export wrapper for the proven WhatsApp helpers (whatsapp.py). Independent of the agent and FastAPI layers; everything above depends on this. Grounded in handler.py's TTL turn-append pattern and whatsapp_lambda.py's helper set.",
+  "status": "pending",
+  "steps": [
+    "Create data.py. At module scope read table names from env (USERS_TABLE_NAME, CHAT_HISTORY_TABLE_NAME, CHECKPOINTER_TABLE_NAME, MAPPING_TABLE_NAME) and AWS_REGION (default us-east-1); create one boto3.resource('dynamodb') and cache Table handles lazily (so tests can set env before first use). Implement: is_authorized_user(user_id)->bool via get_item on USERS_TABLE PK user_id, returning 'Item' in response; append_turn(conversation_id, role, text) putting {conversation_id, sk=f'{int(time.time()*1000)}-{uuid4().hex[:8]}', role, text, created_at} to CHAT_HISTORY_TABLE; put_mapping(conversation_id, workflow_id, user_id, whatsapp_number) putting {conversation_id, workflow_id, user_id, whatsapp_number} to MAPPING_TABLE; get_mapping(conversation_id)->dict|None via get_item on MAPPING_TABLE. Keep names env-driven (never hardcode).",
+    "Create checkpointer.py with class DynamoDBSaver(BaseCheckpointSaver) importing from langgraph.checkpoint.base. Constructor takes a table name (default from CHECKPOINTER_TABLE_NAME env) and optional serde (default self.serde from base). Use a single checkpointer table with PK 'pk' and SK 'sk'. Checkpoint item: pk=f'{thread_id}::{checkpoint_ns}', sk=f'checkpoint::{checkpoint_id}', plus thread_id, checkpoint_ns, checkpoint_id, optional parent_checkpoint_id, type+checkpoint bytes from serde.dumps_typed(checkpoint), type+metadata bytes from serde.dumps_typed(metadata), and expires_at=int(time.time())+604800. Writes item (one per write): pk same, sk=f'write::{checkpoint_id}::{task_id}::{idx}', task_id, channel, type+value bytes, expires_at as above. Store serialized tuples as Binary.",
+    "Implement DynamoDBSaver.put(config, checkpoint, metadata, new_versions)->RunnableConfig (put checkpoint item; return config with configurable.checkpoint_id set to checkpoint['id']); put_writes(config, writes, task_id, task_path='')->None (BatchWriter put of write items); get_tuple(config)->CheckpointTuple|None (if configurable.checkpoint_id present get that item else Query pk begins_with sk 'checkpoint::' ScanIndexForward=False Limit=1; load matching writes via Query sk begins_with f'write::{checkpoint_id}::'; deserialize via serde.loads_typed; build CheckpointTuple with config, checkpoint, metadata, parent_config, pending_writes); list(config, *, filter=None, before=None, limit=None) iterating checkpoint items newest-first honoring before/limit. Add get_next_version if not provided by base.",
+    "Create whatsapp.py that imports and re-exports send_whatsapp_message, extract_webhook_data, extract_text_messages, normalize_destination from whatsapp_lambda (from whatsapp_lambda import ...). Do not reimplement; this keeps the new code's import surface stable and the WhatsApp behavior identical. Do NOT edit whatsapp_lambda.py."
+  ],
+  "acceptance_criteria": [
+    "python -c \"import data, checkpointer, whatsapp\" succeeds with the pinned deps installed and env vars set.",
+    "Running `python -m pytest tests/test_data.py` passes: is_authorized_user true/false, append_turn writes an item, put_mapping/get_mapping round-trip (moto-mocked DynamoDB).",
+    "Running `python -m pytest tests/test_checkpointer.py` passes: put then get_tuple restores an equivalent checkpoint; put_writes then get_tuple returns pending_writes; stored items carry an integer expires_at ~ now+604800.",
+    "whatsapp.send_whatsapp_message is the same object imported from whatsapp_lambda (no reimplementation)."
+  ],
+  "verification": [
+    "python -m pytest tests/test_data.py tests/test_checkpointer.py -q  (offline, moto + env fixtures; all pass)",
+    "python -c \"import whatsapp, whatsapp_lambda; assert whatsapp.send_whatsapp_message is whatsapp_lambda.send_whatsapp_message\""
+  ],
+  "blocked_reason": null,
+  "findings": ""
+}

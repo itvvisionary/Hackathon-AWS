@@ -1,0 +1,27 @@
+{
+  "id": "FEAT-003",
+  "type": "feat",
+  "description": "Serving layer in app.py: FastAPI app with permissive CORS, GET / (serve test_page.html), POST /ask, POST /callback, Mangum wrapping for the HTTP path, and the single lambda_handler dispatcher that routes aws:sqs events to the WhatsApp/SQS batch path and everything else to Mangum. Plus the test_page.html test UI. Depends on FEAT-001 (data.py, whatsapp.py) and FEAT-002 (run_agent). Mirrors handler.py's SQS batch shape and reuses whatsapp_lambda extractors via whatsapp.py.",
+  "status": "pending",
+  "steps": [
+    "In app.py create app = FastAPI() and add CORSMiddleware with allow_origins=['*'], allow_methods=['*'], allow_headers=['*'] so a file:// HTML page can call the Function URL.",
+    "GET / -> return test_page.html contents as HTMLResponse/FileResponse (read the file next to app.py).",
+    "POST /ask with a pydantic body {conversation_id: str, message: str}: call agent.run_agent(conversation_id, message); data.append_turn(conversation_id, 'user', message) and data.append_turn(conversation_id, 'assistant', reply); return {'reply': reply, 'conversation_id': conversation_id}.",
+    "POST /callback with body {conversation_id: str, receipt_id: str, total_cost}: m = data.get_mapping(conversation_id); compose text = f'Your order is complete. Receipt {receipt_id}. Total cost {total_cost}.'; if WHATSAPP_PHONE_NUMBER_ID env set and m and m.get('whatsapp_number'): whatsapp.send_whatsapp_message(m['whatsapp_number'], text) wrapped in try/except that logs on failure; ALWAYS data.append_turn(conversation_id, 'assistant', text); return {'status': 'ok'}. Never crash when WhatsApp env/number absent.",
+    "Add handler = Mangum(app). Implement lambda_handler(event, context): if event.get('Records') and event['Records'][0].get('eventSource') == 'aws:sqs': return process_sqs_batch(event); else return handler(event, context).",
+    "Implement process_sqs_batch(event): batch_item_failures=[]; for record in event['Records']: try: webhook = whatsapp.extract_webhook_data(record); for msg in whatsapp.extract_text_messages(webhook): sender=msg['sender']; reply = agent.run_agent(sender, msg['text'], whatsapp_number=sender); data.append_turn(sender,'user',msg['text']); data.append_turn(sender,'assistant',reply); whatsapp.send_whatsapp_message(sender, reply); except Exception: log + append {'itemIdentifier': record.get('messageId')}. Return {'batchItemFailures': batch_item_failures}. (conversation_id == sender so the mapping write in create_order stores the phone number.)",
+    "Create test_page.html: vanilla JS + fetch, no build step. Inputs for Function URL base and conversation_id (default a random id), a message box + Send button POSTing {conversation_id, message} to {base}/ask and rendering chat bubbles (including the interrupt/confirm prompt so the user can type 'yes'). A callback section with receipt_id + total_cost inputs and a button POSTing {conversation_id, receipt_id, total_cost} to {base}/callback."
+  ],
+  "acceptance_criteria": [
+    "python -c \"import app\" succeeds and exposes app, handler, lambda_handler.",
+    "tests/test_app.py passes (Bedrock/DynamoDB/WhatsApp/run_agent mocked): GET / returns 200 with HTML; POST /ask returns {'reply','conversation_id'} and appends two turns; POST /callback composes the receipt/total message, appends an assistant turn, returns {'status':'ok'}, and does NOT crash when WhatsApp env vars are absent.",
+    "lambda_handler routes a synthetic {'Records':[{'eventSource':'aws:sqs',...}]} event to process_sqs_batch (verified by the batchItemFailures-shaped return) and routes a non-SQS event to Mangum.",
+    "process_sqs_batch returns {'batchItemFailures': [...]} and isolates per-record failures like handler.py."
+  ],
+  "verification": [
+    "python -m pytest tests/test_app.py -q  (offline; TestClient + mocks; all pass)",
+    "python -c \"import app; assert hasattr(app,'lambda_handler') and hasattr(app,'handler')\""
+  ],
+  "blocked_reason": null,
+  "findings": ""
+}

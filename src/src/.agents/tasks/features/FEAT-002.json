@@ -1,0 +1,25 @@
+{
+  "id": "FEAT-002",
+  "type": "feat",
+  "description": "Agent core in agent.py: LangGraph state + graph, the two tools (get_current_time, create_order), ChatBedrockConverse LLM bound to tools, authorization gate, human-in-the-loop interrupt before create_order, and the shared run_agent(conversation_id, user_text, whatsapp_number='') entry point wired to the DynamoDBSaver from FEAT-001. Depends on FEAT-001 (data.py, checkpointer.py). This is the shared core both triggers call.",
+  "status": "pending",
+  "steps": [
+    "In agent.py define the graph state (TypedDict) with messages: Annotated[list, add_messages], authorized: bool, user_id: Optional[str], conversation_id: str, whatsapp_number: str.",
+    "Define tool get_current_time() returning a string with UTC ISO 8601 and a human-readable time. Define tool create_order(user_name, user_email, user_address, products, number_of_products, conversation_id) that HTTP POSTs to os.environ['ORDER_API_ENDPOINT'] a JSON body containing all six fields INCLUDING conversation_id, adds Authorization: Bearer {ORDER_API_KEY} when that env var is set, uses requests with a timeout, parses workflow_id from the response, and on success calls data.put_mapping(conversation_id, workflow_id, user_id, whatsapp_number) then returns a dict including workflow_id and a user-facing confirmation. user_id and whatsapp_number must come from graph state/config (e.g. injected via RunnableConfig or a closure), NOT from LLM-supplied tool args.",
+    "Build the LLM with langchain_aws.ChatBedrockConverse(model=os.environ.get('BEDROCK_MODEL_ID', <sensible Claude inference-profile default>)) and bind the two tools. Write a system prompt that: greets with a welcome, asks for the user ID to authorize, after authorization collects user_name, user_email, user_address, products, number_of_products, and asks for confirmation before ordering.",
+    "Assemble the StateGraph: an 'agent' node calling the tool-bound LLM; an authorization gate that, when not yet authorized, checks the typed id with data.is_authorized_user and either sets authorized/user_id or politely refuses and re-asks; a confirm step that calls langgraph.types.interrupt({...collected params...}) BEFORE create_order executes and only proceeds on an explicit affirmative resume value; a ToolNode (or equivalent) for the two tools; conditional edges routing model tool-calls -> confirm/interrupt -> tools -> back to agent. Compile with checkpointer=DynamoDBSaver().",
+    "Implement run_agent(conversation_id, user_text, whatsapp_number='')->str: config={'configurable': {'thread_id': conversation_id}}; detect a pending interrupt for the thread (via compiled_graph.get_state(config) / checkpointer.get_tuple) and, if paused, call graph.invoke(Command(resume=user_text), config); otherwise graph.invoke({'messages':[HumanMessage(user_text)], 'conversation_id':conversation_id, 'whatsapp_number':whatsapp_number, 'authorized':False, 'user_id':None}, config). Return the latest AI/interrupt text to show the user. Build the graph once at module scope for warm-reuse."
+  ],
+  "acceptance_criteria": [
+    "python -c \"import agent\" succeeds.",
+    "tests/test_agent.py covers and passes (Bedrock LLM, requests.post, and data.* mocked): (1) unauthorized id -> reply refuses and re-asks, no order; (2) authorized id -> proceeds to collect params; (3) all params collected -> interrupt fires and NO HTTP POST to ORDER_API_ENDPOINT occurs yet; (4) resume with 'yes' -> requests.post IS called with a body containing conversation_id and put_mapping is called with (conversation_id, workflow_id, user_id, whatsapp_number); (5) resume with 'no'/decline -> no POST.",
+    "create_order's POST body includes conversation_id and only includes ORDER_API_KEY Authorization header when the env var is set.",
+    "run_agent resumes a paused thread via Command(resume=...) rather than starting a new turn."
+  ],
+  "verification": [
+    "python -m pytest tests/test_agent.py -q  (offline; Bedrock/requests/DynamoDB mocked; the five scenarios pass)",
+    "python -c \"import agent; assert hasattr(agent, 'run_agent')\""
+  ],
+  "blocked_reason": null,
+  "findings": ""
+}

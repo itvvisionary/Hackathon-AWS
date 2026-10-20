@@ -1,0 +1,26 @@
+{
+  "id": "FEAT-004",
+  "type": "docs",
+  "description": "Finalize dependencies, documentation, and the offline test harness: pin requirements.txt for the Lambda layer, expand README.md with layer packaging / env vars / handler path / Function URL / checkpointer TTL / four-table schema, and add the pytest harness (conftest.py, pytest.ini, tests/) that makes the whole suite runnable offline. Depends on FEAT-001..003 (the tests reference those modules). handler.py and whatsapp_lambda.py stay untouched.",
+  "status": "pending",
+  "steps": [
+    "Overwrite requirements.txt with pinned packages: fastapi==0.115.12, mangum==0.19.0, langgraph==0.2.76, langgraph-checkpoint==2.0.26, langchain-aws==0.2.19, langchain-core==0.3.63, pydantic==2.11.4, requests==2.32.3, boto3==1.35.99. Add a comment that boto3 is runtime-bundled (pinned only for local/tests) and must not ship in the layer. Keep moto+pytest in a separate dev note or requirements-dev.txt (not in the layer).",
+    "Add a README.md section 'LangGraph FastAPI agent Lambda' documenting: which packages go in the layer (everything except boto3); build steps (pip install -r requirements.txt -t python/ ; zip -r layer.zip python); all env vars (BEDROCK_MODEL_ID, USERS_TABLE_NAME, CHAT_HISTORY_TABLE_NAME, CHECKPOINTER_TABLE_NAME, MAPPING_TABLE_NAME, ORDER_API_ENDPOINT, ORDER_API_KEY optional, WHATSAPP_PHONE_NUMBER_ID, META_API_VERSION, AWS_REGION); the Lambda handler path app.lambda_handler; that the Function URL must be enabled and public; that the checkpointer table needs TTL enabled on expires_at; and the four tables with their key schemas (USERS PK user_id; CHAT_HISTORY PK conversation_id SK sk; CHECKPOINTER PK pk SK sk + TTL expires_at; MAPPING PK conversation_id). Note handler.py and whatsapp_lambda.py remain as reference and are not the deployed entry point.",
+    "Add pytest.ini (or pyproject [tool.pytest]) pointing at tests/, and conftest.py that sets all required env vars (table names, BEDROCK_MODEL_ID, ORDER_API_ENDPOINT, etc.) before imports, provides moto DynamoDB fixtures creating the four tables with the documented keys, and helpers to mock ChatBedrockConverse, requests.post, and the socialmessaging send. Ensure tests import the new modules after env is set.",
+    "Ensure tests/test_data.py, tests/test_checkpointer.py, tests/test_agent.py, tests/test_app.py (authored in FEAT-001..003) are collected and the full suite is green; add any missing cross-feature integration test (e.g. end-to-end run_agent authorized->interrupt->resume->POST using mocks)."
+  ],
+  "acceptance_criteria": [
+    "pip install -r requirements.txt resolves cleanly in a fresh Python 3.12 venv.",
+    "python -c \"import app, agent, checkpointer, data, whatsapp\" succeeds.",
+    "python -m pytest -q runs the entire suite green offline.",
+    "README documents layer packaging, all env vars, handler path app.lambda_handler, Function URL public, checkpointer TTL on expires_at, and the four table key schemas.",
+    "handler.py and whatsapp_lambda.py are unchanged (git diff shows no edits to them)."
+  ],
+  "verification": [
+    "python -m pip install -r requirements.txt  (clean Python 3.12 venv; resolves)",
+    "python -c \"import app, agent, checkpointer, data, whatsapp\"",
+    "python -m pytest -q  (full suite passes)"
+  ],
+  "blocked_reason": null,
+  "findings": ""
+}

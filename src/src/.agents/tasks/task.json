@@ -1,0 +1,7 @@
+{
+  "task_id": "task-langgraph-fastapi-lambda",
+  "task_description": "Update the existing message-processor Lambda into a LangGraph agent served as a FastAPI app on AWS Lambda, callable BOTH via an HTTP Lambda Function URL (Mangum) AND via SQS (WhatsApp inbound), sharing one run_agent core. LLM is Amazon Bedrock via langchain-aws ChatBedrockConverse (no Bedrock Agents). HITL interrupt before create_order, resumed across stateless invocations by a custom DynamoDB-backed checkpointer. Four DynamoDB tables (users, chat history, checkpointer w/ 7-day TTL, conversation->workflow mapping). conversation_id threads through interrupt/resume, into create_order and the order API body, and back via POST /callback. Leave handler.py and whatsapp_lambda.py untouched; reuse whatsapp_lambda helpers. Target Python 3.12.",
+  "status": "pending",
+  "feature_order": ["FEAT-001", "FEAT-002", "FEAT-003", "FEAT-004"],
+  "blocked_reason": null
+}

@@ -1,0 +1,51 @@
+{
+  "project_type": "AWS Lambda Python application. Reference sample is SNS->SQS->Lambda->DynamoDB+Bedrock->external RPA. We are adding a LangGraph+FastAPI agent Lambda alongside the reference files.",
+  "language": "Python 3.12",
+  "build_system": "No build tool / packaging config exists. Lambda layer is built manually: pip install -r requirements.txt -t python/ ; zip -r layer.zip python. boto3 is runtime-bundled and must NOT be in the layer (pin only for local/tests). The actual Lambda deployment zip contains just the .py files + test_page.html; third-party deps ship as a layer.",
+  "test_framework": "None exists yet. Add pytest + mocking (moto for DynamoDB, unittest.mock for Bedrock/requests/socialmessaging). Create pytest.ini/conftest.py and a tests/ dir. All tests run fully offline.",
+  "build_command": "python -m pip install -r requirements.txt   (into a Python 3.12 venv)",
+  "test_command": "python -m pytest -q",
+  "verification_instructions": "1) Create a clean Python 3.12 venv and `pip install -r requirements.txt`. 2) Import check: `python -c \"import app, agent, checkpointer, data, whatsapp\"`. 3) `python -m pytest -q` runs the offline suite green: data (moto), checkpointer round-trip, agent five HITL scenarios (unauthorized-reject, authorized-proceed, interrupt-before-HTTP-no-POST, resume-triggers-POST+mapping-write, callback-produces-message+history-write), FastAPI TestClient GET / and POST /ask with Bedrock/DynamoDB mocked, and dispatcher routing an SQS event to the SQS path. Grep is NOT verification.",
+  "snapshot_or_generated_files": null,
+  "environment_constraints": "boto3 is bundled in the AWS Lambda Python 3.12 runtime; do not add it to the layer. No AWS credentials/network in tests: mock Bedrock (ChatBedrockConverse), DynamoDB, requests (order API), and the socialmessaging client. Never hardcode model ids, table names, endpoints, or keys; all come from env vars. The HTML page is opened from file:// so the Function URL needs permissive CORS.",
+  "contribution_requirements": "No AGENTS.md/CONTRIBUTING/.kiro steering files exist in the repo (only the sample README.md). Hard rule from the task: DO NOT modify or delete handler.py or whatsapp_lambda.py — they are reference. Reuse whatsapp_lambda.py helpers verbatim (import them). All config via env vars, no hardcoded secrets. Target Python 3.12.",
+  "key_patterns": "whatsapp_lambda.py defines the proven outbound send: send_whatsapp_message(destination, text) uses boto3 client('socialmessaging'), API send_whatsapp_message(originationPhoneNumberId=WHATSAPP_PHONE_NUMBER_ID, metaApiVersion=META_API_VERSION, message=json.dumps({messaging_product:'whatsapp', recipient_type:'individual', to, type:'text', text:{body}})). It also has extract_webhook_data(sqs_record), extract_text_messages(webhook)->[{sender,message_id,text}], normalize_destination(phone). handler.py shows the SQS batch pattern: iterate event['Records'], isolate per-record failures, return {'batchItemFailures':[{'itemIdentifier':messageId}]}, and a DynamoDB turn-append pattern with TTL expires_at. Both are reference; the new SQS path mirrors handler.py's batch shape but reuses whatsapp_lambda's extractors.",
+  "relevant_files": [
+    "handler.py (READ ONLY reference: SQS batch handling + TTL DynamoDB turn pattern)",
+    "whatsapp_lambda.py (READ ONLY reference: import send_whatsapp_message, extract_webhook_data, extract_text_messages, normalize_destination)",
+    "README.md (UPDATE: layer packaging, env vars, handler path, Function URL public, checkpointer TTL, four tables)",
+    "requirements.txt (UPDATE: pin fastapi/mangum/langgraph/langgraph-checkpoint/langchain-aws/langchain-core/pydantic/requests/boto3)",
+    "data.py (NEW: four-table access, env-driven)",
+    "checkpointer.py (NEW: DynamoDBSaver(BaseCheckpointSaver))",
+    "whatsapp.py (NEW: re-export whatsapp_lambda helpers)",
+    "agent.py (NEW: LangGraph graph, tools, interrupt, run_agent)",
+    "app.py (NEW: FastAPI + CORS + Mangum + lambda_handler dispatcher + SQS path)",
+    "test_page.html (NEW: vanilla JS test UI)",
+    ".agents/tasks/plan.md (the detailed plan; this context.json is the compressed hand-off)"
+  ],
+  "directory_structure": "Worktree root = d:\\GenAI Projects\\AWS Hackathon\\AWS CDS Agentic AI Partner Hackathon\\src\\src . It currently holds handler.py, whatsapp_lambda.py, README.md, requirements.txt. New modules (data.py, checkpointer.py, whatsapp.py, agent.py, app.py, test_page.html, conftest.py, pytest.ini, tests/) go in this same directory. Plan + FEAT artifacts live under .agents/tasks (never committed). Lambda handler entry point = app.lambda_handler.",
+  "env_vars": {
+    "BEDROCK_MODEL_ID": "Bedrock model/inference-profile id for ChatBedrockConverse (default a Claude inference-profile id)",
+    "USERS_TABLE_NAME": "authorized users table, PK user_id (S)",
+    "CHAT_HISTORY_TABLE_NAME": "conversation turns, PK conversation_id (S), SK sk (S)",
+    "CHECKPOINTER_TABLE_NAME": "LangGraph checkpointer, PK pk (S), SK sk (S), TTL on expires_at",
+    "MAPPING_TABLE_NAME": "conversation->workflow mapping, PK conversation_id (S)",
+    "ORDER_API_ENDPOINT": "RPA order-start endpoint (HTTP POST)",
+    "ORDER_API_KEY": "optional bearer/api key for the order endpoint",
+    "WHATSAPP_PHONE_NUMBER_ID": "origination phone number id for socialmessaging send (send gated on presence)",
+    "META_API_VERSION": "default v20.0",
+    "AWS_REGION": "default us-east-1"
+  },
+  "pinned_versions": {
+    "fastapi": "0.115.12",
+    "mangum": "0.19.0",
+    "langgraph": "0.2.76",
+    "langgraph-checkpoint": "2.0.26",
+    "langchain-aws": "0.2.19",
+    "langchain-core": "0.3.63",
+    "pydantic": "2.11.4",
+    "requests": "2.32.3",
+    "boto3": "1.35.99",
+    "note": "Proven 0.2.x/0.3.x line; interrupt/Command/BaseCheckpointSaver/ChatBedrockConverse APIs match the plan. If moving to langgraph>=1.0, keep langgraph-checkpoint on the matching major; do not mix a v1 langgraph with a 0.2.x checkpoint."
+  }
+}

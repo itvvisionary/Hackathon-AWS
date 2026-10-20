@@ -1,0 +1,3 @@
+# The sample handler depends only on boto3, which is preinstalled in the AWS
+# Lambda Python runtime. Add third-party packages here and build a custom
+# artifact (see src/README.md) if you need them.
