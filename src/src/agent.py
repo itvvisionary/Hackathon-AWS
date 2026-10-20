@@ -1,0 +1,432 @@
+"""LangGraph agent core: state, tools, LLM, HITL interrupt, and run_agent.
+
+The graph implements the ordering flow both triggers share:
+
+1. Welcome + ask for the user ID; gate on ``data.is_authorized_user`` before
+   anything else. An unknown ID is politely refused and re-asked.
+2. Once authorized, collect the order parameters (user_name, user_email,
+   user_address, products, number_of_products).
+3. Before the ``create_order`` tool runs, pause with ``interrupt(...)`` so the
+   user can confirm the collected parameters. Only an explicit affirmative
+   resume value lets the order proceed; anything else cancels.
+4. ``create_order`` POSTs to the RPA order endpoint (including the
+   conversation_id in the body), parses the workflow_id, and records the
+   conversation->workflow mapping via ``data.put_mapping``.
+
+``user_id`` and ``whatsapp_number`` are taken from graph state (never from
+LLM-supplied tool arguments) when the order is placed. Every setting comes from
+the environment; nothing is hardcoded.
+"""
+
+import datetime
+import json
+import os
+from typing import Annotated, Optional, TypedDict
+
+import requests
+from langchain_aws import ChatBedrockConverse
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langchain_core.tools import tool
+from langgraph.graph import END, START, StateGraph
+from langgraph.graph.message import add_messages
+from langgraph.types import Command, interrupt
+
+import data
+from checkpointer import DynamoDBSaver
+
+DEFAULT_MODEL_ID = "us.anthropic.claude-3-5-sonnet-20241022-v2:0"
+ORDER_API_TIMEOUT = 30
+
+SYSTEM_PROMPT = (
+    "You are a friendly ordering assistant. Start every new conversation with a "
+    "short welcome and ask the user for their user ID so you can authorize them. "
+    "Do not collect any order details until the user has been authorized. Once "
+    "the user is authorized, collect all of these fields one or more at a time: "
+    "user_name, user_email, user_address, products, and number_of_products. "
+    "When you have all five fields, ask the user to confirm before placing the "
+    "order, then call the create_order tool. Use the get_current_time tool only "
+    "if the user asks about the current time. Never ask the user for their "
+    "user_id again once they are authorized."
+)
+
+
+# --- Graph state -----------------------------------------------------------
+
+
+class AgentState(TypedDict):
+    """Mutable state threaded through the graph for one conversation."""
+
+    messages: Annotated[list, add_messages]
+    authorized: bool
+    user_id: Optional[str]
+    conversation_id: str
+    whatsapp_number: str
+
+
+# --- Tools -----------------------------------------------------------------
+
+
+@tool
+def get_current_time() -> str:
+    """Return the current UTC time in ISO 8601 and a human-readable form."""
+    now = datetime.datetime.now(datetime.timezone.utc)
+    iso = now.isoformat()
+    human = now.strftime("%A, %d %B %Y at %H:%M:%S UTC")
+    return f"Current time: {iso} ({human})"
+
+
+@tool
+def create_order(
+    user_name: str,
+    user_email: str,
+    user_address: str,
+    products: str,
+    number_of_products: int,
+    conversation_id: str,
+) -> dict:
+    """Start an order workflow via the RPA order endpoint.
+
+    POSTs the order details (including ``conversation_id``) to the configured
+    order API, parses the returned ``workflow_id`` and records the
+    conversation->workflow mapping. ``user_id`` and ``whatsapp_number`` are
+    injected from graph state, not from the model's arguments.
+    """
+    return place_order(
+        user_name=user_name,
+        user_email=user_email,
+        user_address=user_address,
+        products=products,
+        number_of_products=number_of_products,
+        conversation_id=conversation_id,
+        user_id=None,
+        whatsapp_number="",
+    )
+
+
+def place_order(
+    *,
+    user_name,
+    user_email,
+    user_address,
+    products,
+    number_of_products,
+    conversation_id,
+    user_id,
+    whatsapp_number,
+):
+    """Perform the order POST + mapping write using state-sourced identity.
+
+    Separated from the ``create_order`` tool so the executing node can supply
+    ``user_id``/``whatsapp_number`` from graph state rather than trusting the
+    model. Returns a dict with ``workflow_id`` and a user-facing confirmation.
+    """
+    endpoint = os.environ["ORDER_API_ENDPOINT"]
+    body = {
+        "user_name": user_name,
+        "user_email": user_email,
+        "user_address": user_address,
+        "products": products,
+        "number_of_products": number_of_products,
+        "conversation_id": conversation_id,
+    }
+    headers = {"Content-Type": "application/json"}
+    api_key = os.environ.get("ORDER_API_KEY")
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    response = requests.post(
+        endpoint, json=body, headers=headers, timeout=ORDER_API_TIMEOUT
+    )
+    response.raise_for_status()
+    payload = response.json()
+    workflow_id = payload.get("workflow_id")
+
+    data.put_mapping(conversation_id, workflow_id, user_id, whatsapp_number)
+
+    return {
+        "workflow_id": workflow_id,
+        "message": (
+            f"Your order has been started (workflow {workflow_id}). "
+            "You'll receive an update once it finishes."
+        ),
+    }
+
+
+TOOLS = [get_current_time, create_order]
+TOOLS_BY_NAME = {t.name: t for t in TOOLS}
+
+
+# --- LLM -------------------------------------------------------------------
+
+
+def _build_llm():
+    model_id = os.environ.get("BEDROCK_MODEL_ID", DEFAULT_MODEL_ID)
+    region = os.environ.get("AWS_REGION", "us-east-1")
+    return ChatBedrockConverse(model=model_id, region_name=region).bind_tools(TOOLS)
+
+
+# --- Nodes -----------------------------------------------------------------
+
+
+def _last_human_text(messages):
+    for message in reversed(messages):
+        if isinstance(message, HumanMessage):
+            return message.content if isinstance(message.content, str) else ""
+    return ""
+
+
+def authorize_node(state: AgentState) -> dict:
+    """Validate the typed user ID before any ordering can happen."""
+    if state.get("authorized"):
+        return {}
+
+    candidate = _last_human_text(state["messages"]).strip()
+    if candidate and data.is_authorized_user(candidate):
+        return {
+            "authorized": True,
+            "user_id": candidate,
+            "messages": [
+                AIMessage(
+                    content=(
+                        "Thanks, you're verified. I can help you place an order. "
+                        "To get started, what's your name?"
+                    )
+                )
+            ],
+        }
+
+    return {
+        "messages": [
+            AIMessage(
+                content=(
+                    "I couldn't verify that ID. Please double-check and send me "
+                    "your user ID again so I can authorize you."
+                )
+            )
+        ]
+    }
+
+
+def agent_node(state: AgentState) -> dict:
+    """Call the tool-bound LLM with the system prompt prepended."""
+    llm = _build_llm()
+    messages = [("system", SYSTEM_PROMPT), *state["messages"]]
+    response = llm.invoke(messages)
+    return {"messages": [response]}
+
+
+def confirm_node(state: AgentState) -> dict:
+    """Pause before create_order so the user can confirm the parameters.
+
+    Raises ``interrupt`` with the collected parameters. On resume the resume
+    value is interpreted as the user's decision; anything that is not an
+    explicit affirmative cancels the order.
+    """
+    tool_call = _pending_create_order_call(state["messages"])
+    params = dict(tool_call["args"]) if tool_call else {}
+
+    decision = interrupt(
+        {
+            "type": "confirm_order",
+            "message": "Please confirm you want to place this order.",
+            "parameters": params,
+        }
+    )
+
+    if _is_affirmative(decision):
+        return {}
+
+    return {
+        "messages": [
+            ToolMessage(
+                content="Order cancelled by the user.",
+                tool_call_id=tool_call["id"] if tool_call else "cancelled",
+            ),
+            AIMessage(
+                content=(
+                    "No problem, I've cancelled that order. Let me know if you'd "
+                    "like to change anything or try again."
+                )
+            ),
+        ]
+    }
+
+
+def tools_node(state: AgentState) -> dict:
+    """Execute the tools requested by the last AI message.
+
+    For ``create_order`` the identity fields (user_id, whatsapp_number) and the
+    conversation_id come from graph state, not the model's tool arguments.
+    """
+    last = state["messages"][-1]
+    tool_calls = getattr(last, "tool_calls", None) or []
+    outputs = []
+
+    for call in tool_calls:
+        name = call["name"]
+        args = dict(call.get("args", {}))
+        if name == "create_order":
+            result = place_order(
+                user_name=args.get("user_name"),
+                user_email=args.get("user_email"),
+                user_address=args.get("user_address"),
+                products=args.get("products"),
+                number_of_products=args.get("number_of_products"),
+                conversation_id=state["conversation_id"],
+                user_id=state.get("user_id"),
+                whatsapp_number=state.get("whatsapp_number", ""),
+            )
+        else:
+            result = TOOLS_BY_NAME[name].invoke(args)
+
+        content = result if isinstance(result, str) else json.dumps(result)
+        outputs.append(ToolMessage(content=content, tool_call_id=call["id"]))
+
+    return {"messages": outputs}
+
+
+# --- Routing helpers -------------------------------------------------------
+
+
+def _pending_create_order_call(messages):
+    if not messages:
+        return None
+    last = messages[-1]
+    for call in getattr(last, "tool_calls", None) or []:
+        if call["name"] == "create_order":
+            return call
+    return None
+
+
+def _is_affirmative(value):
+    if value is True:
+        return True
+    if isinstance(value, str):
+        return value.strip().lower() in {
+            "yes",
+            "y",
+            "confirm",
+            "confirmed",
+            "ok",
+            "okay",
+            "sure",
+            "yep",
+            "yeah",
+            "proceed",
+        }
+    return False
+
+
+def route_after_authorize(state: AgentState) -> str:
+    return "agent" if state.get("authorized") else END
+
+
+def route_after_agent(state: AgentState) -> str:
+    last = state["messages"][-1]
+    tool_calls = getattr(last, "tool_calls", None) or []
+    if not tool_calls:
+        return END
+    if any(call["name"] == "create_order" for call in tool_calls):
+        return "confirm"
+    return "tools"
+
+
+def route_after_confirm(state: AgentState) -> str:
+    """After confirm, run tools only if the order was not cancelled."""
+    last = state["messages"][-1]
+    if isinstance(last, AIMessage) and not getattr(last, "tool_calls", None):
+        return END
+    return "tools"
+
+
+# --- Graph assembly --------------------------------------------------------
+
+
+def build_graph(checkpointer=None):
+    graph = StateGraph(AgentState)
+    graph.add_node("authorize", authorize_node)
+    graph.add_node("agent", agent_node)
+    graph.add_node("confirm", confirm_node)
+    graph.add_node("tools", tools_node)
+
+    graph.add_edge(START, "authorize")
+    graph.add_conditional_edges(
+        "authorize", route_after_authorize, {"agent": "agent", END: END}
+    )
+    graph.add_conditional_edges(
+        "agent",
+        route_after_agent,
+        {"confirm": "confirm", "tools": "tools", END: END},
+    )
+    graph.add_conditional_edges(
+        "confirm", route_after_confirm, {"tools": "tools", END: END}
+    )
+    graph.add_edge("tools", "agent")
+
+    if checkpointer is None:
+        checkpointer = DynamoDBSaver()
+    return graph.compile(checkpointer=checkpointer)
+
+
+# Build once at module scope for warm-container reuse.
+compiled_graph = build_graph()
+
+
+# --- Entry point -----------------------------------------------------------
+
+
+def _is_paused(config):
+    """Return True if the thread has a pending interrupt waiting to resume."""
+    state = compiled_graph.get_state(config)
+    return bool(state.next)
+
+
+def _latest_text(config):
+    """Return the text to show the user: an active interrupt or the last AI message."""
+    state = compiled_graph.get_state(config)
+
+    interrupts = getattr(state, "interrupts", None) or []
+    if interrupts:
+        payload = interrupts[-1].value
+        if isinstance(payload, dict):
+            return payload.get("message", json.dumps(payload))
+        return str(payload)
+
+    for message in reversed(state.values.get("messages", [])):
+        if isinstance(message, AIMessage):
+            content = message.content
+            if isinstance(content, str):
+                return content
+            if isinstance(content, list):
+                parts = [
+                    block.get("text", "")
+                    for block in content
+                    if isinstance(block, dict)
+                ]
+                return "".join(parts)
+    return ""
+
+
+def run_agent(conversation_id, user_text, whatsapp_number=""):
+    """Advance the conversation one turn and return the text to show the user.
+
+    If the thread is paused on an interrupt, ``user_text`` resumes it via
+    ``Command(resume=...)``; otherwise a new turn is started.
+    """
+    config = {"configurable": {"thread_id": conversation_id}}
+
+    if _is_paused(config):
+        compiled_graph.invoke(Command(resume=user_text), config)
+    else:
+        compiled_graph.invoke(
+            {
+                "messages": [HumanMessage(content=user_text)],
+                "conversation_id": conversation_id,
+                "whatsapp_number": whatsapp_number,
+                "authorized": False,
+                "user_id": None,
+            },
+            config,
+        )
+
+    return _latest_text(config)
