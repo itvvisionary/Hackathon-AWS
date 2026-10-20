@@ -21,6 +21,18 @@ CHAT_HISTORY_TABLE_NAME = "test-chat-history"
 CHECKPOINTER_TABLE_NAME = "test-checkpointer"
 MAPPING_TABLE_NAME = "test-mapping"
 
+# Modules under test (agent.py) build their LangGraph graph at import time, and
+# the DynamoDBSaver reads CHECKPOINTER_TABLE_NAME eagerly. Pytest imports the
+# test modules during collection, before any fixture runs, so seed the table
+# names (and region) at conftest import time too. The autouse ``_env`` fixture
+# below still re-applies these per test via monkeypatch for isolation.
+os.environ.setdefault("AWS_REGION", "us-east-1")
+os.environ.setdefault("AWS_DEFAULT_REGION", "us-east-1")
+os.environ.setdefault("USERS_TABLE_NAME", USERS_TABLE_NAME)
+os.environ.setdefault("CHAT_HISTORY_TABLE_NAME", CHAT_HISTORY_TABLE_NAME)
+os.environ.setdefault("CHECKPOINTER_TABLE_NAME", CHECKPOINTER_TABLE_NAME)
+os.environ.setdefault("MAPPING_TABLE_NAME", MAPPING_TABLE_NAME)
+
 
 @pytest.fixture(autouse=True)
 def _env(monkeypatch):
