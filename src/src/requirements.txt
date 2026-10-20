@@ -1,3 +1,29 @@
-# The sample handler depends only on boto3, which is preinstalled in the AWS
-# Lambda Python runtime. Add third-party packages here and build a custom
-# artifact (see src/README.md) if you need them.
+# Runtime dependencies for the LangGraph + FastAPI agent Lambda.
+#
+# Everything listed here EXCEPT boto3 ships in the Lambda layer. Build it with:
+#     pip install -r requirements.txt -t python/
+#     zip -r layer.zip python
+# then exclude boto3 from the layer (see note below).
+#
+# boto3 is bundled in the AWS Lambda Python 3.12 runtime, so it must NOT ship in
+# the layer. It is pinned here only so local development and the offline test
+# suite resolve a known-good version; drop/exclude it when packaging the layer.
+#
+# NOTE ON VERSIONS: context.json proposed the langgraph 0.2.x / langchain 0.3.x
+# line. The agent, checkpointer, and serving code (FEAT-001..003) were written
+# and verified green against the langgraph 1.x line below, which is what
+# resolves cleanly on Python 3.12 today. These pins are internally consistent
+# (langgraph 1.x with langgraph-checkpoint 4.x); do not downgrade one without
+# the other. Re-pin only after re-running the full offline suite.
+
+fastapi==0.135.2
+mangum==0.19.0
+langgraph==1.1.3
+langgraph-checkpoint==4.0.0
+langchain-aws==1.4.1
+langchain-core==1.6.3
+pydantic==2.12.5
+requests==2.32.5
+
+# Runtime-bundled in AWS Lambda; pinned for local/tests only, keep OUT of layer.
+boto3==1.43.103

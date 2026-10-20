@@ -1,0 +1,6 @@
+# Dev/test-only dependencies. These run the offline test suite and must NOT be
+# packaged into the Lambda layer or the deployment zip.
+-r requirements.txt
+
+pytest==9.1.1
+moto==5.2.4
