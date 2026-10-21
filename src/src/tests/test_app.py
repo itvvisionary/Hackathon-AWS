@@ -23,8 +23,10 @@ def mocked(monkeypatch):
 
     append_turn = MagicMock()
     get_mapping = MagicMock(return_value=None)
+    get_history = MagicMock(return_value=[])
     monkeypatch.setattr(app.data, "append_turn", append_turn)
     monkeypatch.setattr(app.data, "get_mapping", get_mapping)
+    monkeypatch.setattr(app.data, "get_history", get_history)
 
     extract_webhook_data = MagicMock()
     extract_text_messages = MagicMock(return_value=[])
@@ -44,6 +46,7 @@ def mocked(monkeypatch):
     harness.run_agent = run_agent
     harness.append_turn = append_turn
     harness.get_mapping = get_mapping
+    harness.get_history = get_history
     harness.extract_webhook_data = extract_webhook_data
     harness.extract_text_messages = extract_text_messages
     harness.send_whatsapp_message = send_whatsapp_message
@@ -84,11 +87,14 @@ def test_ask_returns_reply_and_appends_two_turns(mocked, client):
 # --- POST /callback --------------------------------------------------------
 
 
-def test_callback_composes_message_and_appends_turn_without_whatsapp(mocked, client):
-    # Mapping exists and the workflow_id matches -> accepted.
+def test_callback_api_channel_stores_without_whatsapp(mocked, client, monkeypatch):
+    # API channel: even if WhatsApp were configured, nothing is sent; the
+    # message is only stored to history for the UI to load.
+    monkeypatch.setenv("WHATSAPP_PHONE_NUMBER_ID", "pn-123")
     mocked.get_mapping.return_value = {
         "conversation_id": "conv-2",
         "workflow_id": "wf-2",
+        "channel": "api",
     }
     res = client.post(
         "/callback",
@@ -100,12 +106,12 @@ def test_callback_composes_message_and_appends_turn_without_whatsapp(mocked, cli
         },
     )
     assert res.status_code == 200
-    assert res.json() == {"status": "ok"}
+    assert res.json() == {"status": "ok", "channel": "api"}
 
     mocked.get_mapping.assert_called_once_with("conv-2")
     expected = "Your order is complete. Receipt RCPT-9. Total cost 42.50."
     mocked.append_turn.assert_called_once_with("conv-2", "assistant", expected)
-    # No WhatsApp env configured -> never attempt a send, never crash.
+    # API channel -> never send WhatsApp even though it's configured.
     mocked.send_whatsapp_message.assert_not_called()
 
 
@@ -148,6 +154,7 @@ def test_callback_sends_whatsapp_when_configured(mocked, client, monkeypatch):
     monkeypatch.setenv("WHATSAPP_PHONE_NUMBER_ID", "pn-123")
     mocked.get_mapping.return_value = {
         "workflow_id": "wf-3",
+        "channel": "whatsapp",
         "whatsapp_number": "+15551230000",
     }
 
@@ -170,6 +177,7 @@ def test_callback_does_not_crash_when_whatsapp_send_fails(mocked, client, monkey
     monkeypatch.setenv("WHATSAPP_PHONE_NUMBER_ID", "pn-123")
     mocked.get_mapping.return_value = {
         "workflow_id": "wf-4",
+        "channel": "whatsapp",
         "whatsapp_number": "+15551230000",
     }
     mocked.send_whatsapp_message.side_effect = RuntimeError("boom")
@@ -184,9 +192,25 @@ def test_callback_does_not_crash_when_whatsapp_send_fails(mocked, client, monkey
         },
     )
     assert res.status_code == 200
-    assert res.json() == {"status": "ok"}
+    assert res.json() == {"status": "ok", "channel": "whatsapp"}
     # The assistant turn is still recorded despite the WhatsApp failure.
     mocked.append_turn.assert_called_once()
+
+
+def test_history_returns_turns(mocked, client):
+    mocked.get_history.return_value = [
+        {"role": "user", "text": "hi", "created_at": 1},
+        {"role": "assistant", "text": "hello", "created_at": 2},
+    ]
+    res = client.get("/history", params={"conversation_id": "conv-h"})
+    assert res.status_code == 200
+    body = res.json()
+    assert body["conversation_id"] == "conv-h"
+    assert body["turns"] == [
+        {"role": "user", "text": "hi", "created_at": 1},
+        {"role": "assistant", "text": "hello", "created_at": 2},
+    ]
+    mocked.get_history.assert_called_once_with("conv-h")
 
 
 # --- Dispatcher routing ----------------------------------------------------

@@ -55,6 +55,7 @@ the deployed app. The WhatsApp send/extract logic now lives directly in
 | `checkpointer.py`| `DynamoDBSaver(BaseCheckpointSaver)` — LangGraph state persistence       |
 | `data.py`        | Env-driven access to the four DynamoDB tables                           |
 | `whatsapp.py`    | Self-contained WhatsApp send/extract helpers (End User Messaging Social) |
+| `logging_setup.py`| Shared log config (format: time/level/file/func/line) + `@log_io` input/output debug decorator |
 | `test_page.html` | Vanilla-JS local test UI (opened from `file://`)                        |
 
 ## Lambda handler path
@@ -83,7 +84,8 @@ for the browser test flow to reach `/ask` and `/callback`.
 | -------------- | ------------------------------------------------------------------- | ------------------- |
 | `GET /`        | —                                                                   | the test page HTML  |
 | `POST /ask`    | `{ "conversation_id": str, "message": str }`                        | `{ "reply", "conversation_id" }` |
-| `POST /callback` | `{ "conversation_id": str, "workflow_id": str, "receipt_id": str, "total_cost": any }` | `{ "status": "ok" }` |
+| `POST /callback` | `{ "conversation_id": str, "workflow_id": str, "receipt_id": str, "total_cost": any }` | `{ "status": "ok", "channel" }` |
+| `GET /history?conversation_id=…` | query param `conversation_id`                     | `{ "conversation_id", "turns": [{role, text, created_at}] }` |
 
 **Callback matching.** The mapping table is keyed on `conversation_id`. The
 callback must also send the `workflow_id` returned by `create_order`: the hook
@@ -91,6 +93,94 @@ loads the mapping by `conversation_id` and verifies its stored `workflow_id`
 matches the one in the request. A missing mapping or a mismatched `workflow_id`
 returns **404** and does not message the user — so a stale or wrong workflow
 completion is ignored.
+
+**Channel routing.** `create_order` records a `channel` in the mapping —
+`"whatsapp"` when the conversation arrived over SQS/WhatsApp (a sender number is
+present), or `"api"` for the HTTP `/ask` (UI) path. On completion the callback
+routes by that channel: `whatsapp` pushes the message to the user's WhatsApp
+number; `api` only stores the message in chat history (a browser can't receive a
+server push), and the UI retrieves it with **`GET /history`** — the test page's
+**Load history** button does exactly this. Both channels always persist the
+completion turn to the chat-history table.
+
+**Both triggers persist to DynamoDB.** Whether a turn arrives via `POST /ask` or
+via the SQS/WhatsApp path, the user message and the assistant reply are both
+written to the chat-history table, so WhatsApp conversations are stored the same
+way as UI ones.
+
+## SQS / WhatsApp payload
+
+The SQS path handles inbound WhatsApp webhooks (typically `SNS → SQS → Lambda`).
+Unlike the HTTP endpoints, **there is no explicit `conversation_id` field** in
+the payload — the code uses the sender's phone number (the message `from` field)
+as *both* the `conversation_id` and the `whatsapp_number`:
+
+```python
+# app.py, SQS path
+for msg in whatsapp.extract_text_messages(webhook):
+    sender = msg["sender"]                     # <- the "from" field
+    reply = agent.run_agent(sender, msg["text"], whatsapp_number=sender)
+    #                        ^^^^^^ conversation_id      ^^^^^^ whatsapp_number
+```
+
+So the phone number identifies the conversation and is where the callback later
+sends the completion message.
+
+### Webhook message (what SNS publishes)
+
+Publish this as the SNS message; it becomes the `Message` field of the SQS body.
+The **`from` field (here `201001234567`) is the conversation_id**:
+
+```json
+{
+  "whatsAppWebhookEntry": [
+    {
+      "changes": [
+        {
+          "value": {
+            "messaging_product": "whatsapp",
+            "messages": [
+              {
+                "from": "201001234567",
+                "id": "wamid.TESTMESSAGE0001",
+                "type": "text",
+                "text": { "body": "hi, my id is U1001" }
+              }
+            ]
+          }
+        }
+      ]
+    }
+  ]
+}
+```
+
+- `from` → becomes `conversation_id` **and** `whatsapp_number`.
+- `type` must be `"text"` (status/non-text messages are skipped).
+- `text.body` is the user's message passed to the agent.
+
+### Full Lambda event (SNS → SQS)
+
+What the Lambda actually receives — useful for a direct Lambda test too. The
+`body` is a JSON **string** (the SNS envelope), whose `Message` is itself a JSON
+**string** (the webhook above); the extractor unwraps both:
+
+```json
+{
+  "Records": [
+    {
+      "messageId": "11111111-1111-1111-1111-111111111111",
+      "eventSource": "aws:sqs",
+      "body": "{\"Type\":\"Notification\",\"Message\":\"{\\\"whatsAppWebhookEntry\\\":[{\\\"changes\\\":[{\\\"value\\\":{\\\"messaging_product\\\":\\\"whatsapp\\\",\\\"messages\\\":[{\\\"from\\\":\\\"201001234567\\\",\\\"id\\\":\\\"wamid.TESTMESSAGE0001\\\",\\\"type\\\":\\\"text\\\",\\\"text\\\":{\\\"body\\\":\\\"hi, my id is U1001\\\"}}]}}]}]}\"}"
+    }
+  ]
+}
+```
+
+If you publish straight to SQS (no SNS), set `body` to just the webhook JSON
+string — the extractor handles both (it only unwraps when it sees a `Message`
+field). The dispatcher routes an event to this path when
+`Records[0].eventSource == "aws:sqs"`.
 
 ## Building the layer
 
@@ -136,7 +226,7 @@ the third-party dependencies come from the layer above.
 
 ```powershell
 # from src/src
-Compress-Archive -Path app.py,agent.py,checkpointer.py,data.py,whatsapp.py,test_page.html `
+Compress-Archive -Path app.py,agent.py,checkpointer.py,data.py,whatsapp.py,logging_setup.py,test_page.html `
   -DestinationPath function.zip -CompressionLevel Optimal
 ```
 
@@ -182,6 +272,33 @@ Those are **dev-only** and must never be packaged into the layer or the zip.
 | `WHATSAPP_PHONE_NUMBER_ID` | no       | Origination phone-number id for the `socialmessaging` send; outbound WhatsApp is gated on this being present |
 | `META_API_VERSION`         | no       | Meta API version (default `v20.0`)                                 |
 | `AWS_REGION`               | no       | AWS region (default `us-east-1`)                                   |
+| `LOG_LEVEL`                | no       | Log verbosity: `DEBUG`, `INFO` (default), `WARNING`, `ERROR`. Set `DEBUG` to log every endpoint/function's input and output |
+
+## Logging
+
+All modules log through `logging_setup.py`, which formats every line as:
+
+```
+<time> <LEVEL> [<filename>:<function>:<line>] <message>
+```
+
+`LOG_LEVEL` (default `INFO`) controls verbosity. At `DEBUG`, each endpoint and
+key function logs its **input** and **output** data:
+
+- Endpoints (`/ask`, `/callback`, `/history`) and the SQS path log the request
+  and the composed response.
+- Core functions carry a `@log_io` decorator that logs call arguments and the
+  return value, attributed to the real file/function/line (e.g.
+  `[agent.py:place_order:210] -> input: ...`).
+- Long payloads are truncated so logs stay readable.
+
+Example (`LOG_LEVEL=DEBUG`):
+
+```
+2026-10-21 14:57:37 DEBUG [agent.py:run_agent:430] -> input: args=('conv-1', 'hi') kwargs={}
+2026-10-21 14:57:37 DEBUG [data.py:append_turn:88] -> input: args=('conv-1', 'user', 'hi') kwargs={}
+2026-10-21 14:57:37 DEBUG [agent.py:run_agent:430] <- output: 'Welcome! ...'
+```
 
 ## DynamoDB tables
 
@@ -268,16 +385,18 @@ do not seed this.
 | Attribute         | Type | Notes                                              |
 | ----------------- | ---- | -------------------------------------------------- |
 | `conversation_id` | S    | partition key                                      |
-| `workflow_id`     | S    | returned by the RPA; the callback must echo it     |
+| `workflow_id`     | S    | the RPA response `id`, stored as a string; the callback must echo it |
 | `user_id`         | S    | the verified user                                  |
-| `whatsapp_number` | S    | where the callback sends the completion message    |
+| `whatsapp_number` | S    | WhatsApp recipient (empty for the API/UI channel)  |
+| `channel`         | S    | `"whatsapp"` or `"api"` — how the order was placed; the callback routes the completion the same way |
 
 ```json
 {
   "conversation_id": "conv-ab12cd34",
-  "workflow_id": "wf-abc-123",
+  "workflow_id": "237436573",
   "user_id": "U1001",
-  "whatsapp_number": "+201001234567"
+  "whatsapp_number": "+201001234567",
+  "channel": "whatsapp"
 }
 ```
 

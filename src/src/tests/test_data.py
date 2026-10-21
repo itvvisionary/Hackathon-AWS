@@ -45,6 +45,7 @@ def test_put_and_get_mapping_round_trip(dynamodb):
         workflow_id="wf-42",
         user_id="u-123",
         whatsapp_number="+15551234567",
+        channel="whatsapp",
     )
 
     mapping = data.get_mapping("conv-9")
@@ -53,8 +54,23 @@ def test_put_and_get_mapping_round_trip(dynamodb):
         "workflow_id": "wf-42",
         "user_id": "u-123",
         "whatsapp_number": "+15551234567",
+        "channel": "whatsapp",
     }
 
 
 def test_get_mapping_missing_returns_none(dynamodb):
     assert data.get_mapping("nope") is None
+
+
+def test_get_history_returns_turns_in_order(dynamodb):
+    data.append_turn("conv-h", "user", "first")
+    data.append_turn("conv-h", "assistant", "second")
+    data.append_turn("conv-h", "user", "third")
+
+    turns = data.get_history("conv-h")
+    assert [t["text"] for t in turns] == ["first", "second", "third"]
+    assert [t["role"] for t in turns] == ["user", "assistant", "user"]
+
+
+def test_get_history_empty_for_unknown_conversation(dynamodb):
+    assert data.get_history("nobody") == []

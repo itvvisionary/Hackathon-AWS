@@ -38,6 +38,9 @@ from langgraph.types import Command, interrupt
 
 import data
 from checkpointer import DynamoDBSaver
+from logging_setup import get_logger, log_io
+
+LOG = get_logger(__name__)
 
 DEFAULT_MODEL_ID = "us.anthropic.claude-3-5-sonnet-20241022-v2:0"
 ORDER_API_TIMEOUT = 30
@@ -114,6 +117,7 @@ def verify_user(user_id: str) -> dict:
     return _verify_user_lookup((user_id or "").strip())
 
 
+@log_io()
 def _verify_user_lookup(candidate):
     """Shared lookup used by the tool and by tools_node (for state updates)."""
     if not candidate:
@@ -165,9 +169,11 @@ def create_order(
         conversation_id=conversation_id,
         user_id=None,
         whatsapp_number="",
+        channel="api",
     )
 
 
+@log_io()
 def place_order(
     *,
     user_name,
@@ -178,14 +184,17 @@ def place_order(
     conversation_id,
     user_id,
     whatsapp_number,
+    channel,
 ):
     """Perform the order POST + mapping write using state-sourced identity.
 
     Separated from the ``create_order`` tool so the executing node can supply
-    ``user_id``/``whatsapp_number`` from graph state rather than trusting the
-    model. The workflow id is taken from the RPA response ``id`` field (a
-    numeric id, coerced to a string). Returns a dict with ``workflow_id`` and a
-    user-facing confirmation.
+    ``user_id``/``whatsapp_number``/``channel`` from graph state rather than
+    trusting the model. ``channel`` is ``"whatsapp"`` or ``"api"`` and is stored
+    in the mapping so the callback can route the completion the same way. The
+    workflow id is taken from the RPA response ``id`` field (a numeric id,
+    coerced to a string). Returns a dict with ``workflow_id`` and a user-facing
+    confirmation.
     """
     endpoint = os.environ["ORDER_API_ENDPOINT"]
     body = {
@@ -207,11 +216,15 @@ def place_order(
         else:
             headers["Authorization"] = f"Bearer {api_key}"
 
+    LOG.debug("order POST input: endpoint=%s body=%r auth=%s", endpoint, body,
+              "yes" if "Authorization" in headers else "no")
     response = requests.post(
         endpoint, json=body, headers=headers, timeout=ORDER_API_TIMEOUT
     )
     response.raise_for_status()
     payload = response.json()
+    LOG.debug("order POST output: status=%s payload=%r",
+              getattr(response, "status_code", "?"), payload)
 
     # The RPA response identifies the workflow by its ``id`` field, e.g.
     #   {"key": "...", "state": "Pending", "id": 237436573, ...}
@@ -222,7 +235,7 @@ def place_order(
     # Store/compare the workflow id as a string (DynamoDB key + callback match).
     workflow_id = str(raw_id) if raw_id is not None else None
 
-    data.put_mapping(conversation_id, workflow_id, user_id, whatsapp_number)
+    data.put_mapping(conversation_id, workflow_id, user_id, whatsapp_number, channel)
 
     return {
         "workflow_id": workflow_id,
@@ -249,6 +262,7 @@ def _build_llm():
 # --- Nodes -----------------------------------------------------------------
 
 
+@log_io()
 def agent_node(state: AgentState) -> dict:
     """Call the tool-bound LLM with the system prompt prepended."""
     llm = _build_llm()
@@ -273,6 +287,7 @@ def _format_order_summary(params):
     return "\n".join(lines)
 
 
+@log_io()
 def confirm_node(state: AgentState) -> dict:
     """Pause before create_order so the user can confirm the parameters.
 
@@ -331,6 +346,7 @@ def confirm_node(state: AgentState) -> dict:
     return {"reconfirm": True}
 
 
+@log_io()
 def tools_node(state: AgentState) -> dict:
     """Execute the tools requested by the last AI message.
 
@@ -372,6 +388,11 @@ def tools_node(state: AgentState) -> dict:
             }
 
         elif name == "create_order":
+            wa_number = state.get("whatsapp_number", "") or ""
+            # Channel is derived from how the conversation reached us: a WhatsApp
+            # sender number means the SQS/WhatsApp path; its absence means the
+            # HTTP /ask (UI) path.
+            channel = "whatsapp" if wa_number else "api"
             result = place_order(
                 user_name=args.get("user_name"),
                 user_email=args.get("user_email"),
@@ -380,7 +401,8 @@ def tools_node(state: AgentState) -> dict:
                 number_of_products=args.get("number_of_products"),
                 conversation_id=state["conversation_id"],
                 user_id=state.get("user_id") or new_user_id,
-                whatsapp_number=state.get("whatsapp_number", ""),
+                whatsapp_number=wa_number,
+                channel=channel,
             )
 
         else:
@@ -541,6 +563,7 @@ def _latest_text(config):
     return ""
 
 
+@log_io()
 def run_agent(conversation_id, user_text, whatsapp_number=""):
     """Advance the conversation one turn and return the text to show the user.
 

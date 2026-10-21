@@ -27,6 +27,10 @@ from langgraph.checkpoint.base import (
     get_checkpoint_id,
 )
 
+from logging_setup import get_logger
+
+LOG = get_logger(__name__)
+
 TTL_SECONDS = 604800  # 7 days
 
 
@@ -71,6 +75,10 @@ class DynamoDBSaver(BaseCheckpointSaver):
         thread_id = config["configurable"]["thread_id"]
         checkpoint_ns = config["configurable"].get("checkpoint_ns", "")
         checkpoint_id = checkpoint["id"]
+        LOG.debug(
+            "checkpoint put: thread_id=%s ns=%s checkpoint_id=%s",
+            thread_id, checkpoint_ns, checkpoint_id,
+        )
         parent_checkpoint_id = config["configurable"].get("checkpoint_id")
 
         checkpoint_type, checkpoint_bytes = self.serde.dumps_typed(checkpoint)
@@ -183,6 +191,10 @@ class DynamoDBSaver(BaseCheckpointSaver):
         checkpoint_ns = config["configurable"].get("checkpoint_ns", "")
         pk = self._pk(thread_id, checkpoint_ns)
         checkpoint_id = get_checkpoint_id(config)
+        LOG.debug(
+            "checkpoint get_tuple: thread_id=%s ns=%s checkpoint_id=%s",
+            thread_id, checkpoint_ns, checkpoint_id,
+        )
 
         if checkpoint_id:
             response = self.table.get_item(

@@ -249,9 +249,28 @@ def test_resume_yes_triggers_post_and_mapping(mocked):
     assert body["conversation_id"] == "conv-4"
     assert "Authorization" not in kwargs["headers"]
 
-    # Workflow id is the RPA ``id`` field, coerced to a string.
+    # Workflow id is the RPA ``id`` field, coerced to a string. A whatsapp_number
+    # was supplied, so the channel is recorded as "whatsapp".
     mocked.put_mapping.assert_called_once_with(
-        "conv-4", "237436573", "U1001", "+15551230000"
+        "conv-4", "237436573", "U1001", "+15551230000", "whatsapp"
+    )
+
+
+def test_resume_yes_api_channel_when_no_whatsapp_number(mocked):
+    # No whatsapp_number (UI/API path) -> channel recorded as "api".
+    mocked.set_llm(
+        _ai_verify("U1001"),
+        _ai("Thanks, verified."),
+        _ai_create_order(),
+        _ai("All done!"),
+    )
+
+    agent.run_agent("conv-api", "my id is U1001")  # no whatsapp_number
+    agent.run_agent("conv-api", "my details are ...")
+    agent.run_agent("conv-api", "yes")
+
+    mocked.put_mapping.assert_called_once_with(
+        "conv-api", "237436573", "U1001", "", "api"
     )
 
 

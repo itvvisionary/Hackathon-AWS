@@ -15,12 +15,13 @@ Public surface:
 """
 
 import json
-import logging
 import os
 
 import boto3
 
-LOG = logging.getLogger()
+from logging_setup import get_logger, log_io
+
+LOG = get_logger(__name__)
 
 AWS_REGION = os.environ.get("AWS_REGION", "us-east-1")
 WHATSAPP_PHONE_NUMBER_ID = os.environ.get("WHATSAPP_PHONE_NUMBER_ID")
@@ -53,6 +54,7 @@ def parse_json_if_string(value):
 # EXTRACT WEBHOOK FROM SQS
 # =========================================================
 
+@log_io()
 def extract_webhook_data(sqs_record):
     """Return the webhook dict from an SQS record.
 
@@ -82,6 +84,7 @@ def extract_webhook_data(sqs_record):
 # EXTRACT INCOMING WHATSAPP TEXT MESSAGES
 # =========================================================
 
+@log_io()
 def extract_text_messages(webhook):
     """Extract incoming text messages from a WhatsApp webhook.
 
@@ -219,6 +222,7 @@ def normalize_destination(phone_number):
 # SEND WHATSAPP MESSAGE
 # =========================================================
 
+@log_io()
 def send_whatsapp_message(destination, text):
     """Send a text reply via AWS End User Messaging Social."""
     if not WHATSAPP_PHONE_NUMBER_ID:

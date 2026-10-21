@@ -13,6 +13,10 @@ import uuid
 
 import boto3
 
+from logging_setup import get_logger, log_io
+
+LOG = get_logger(__name__)
+
 
 def _region():
     return os.environ.get("AWS_REGION", "us-east-1")
@@ -60,12 +64,14 @@ def _mapping_table():
 
 # --- Users -----------------------------------------------------------------
 
+@log_io()
 def is_authorized_user(user_id):
     """Return True if ``user_id`` exists in the users table (PK ``user_id``)."""
     response = _users_table().get_item(Key={"user_id": user_id})
     return "Item" in response
 
 
+@log_io()
 def get_user(user_id):
     """Return the full users-table item for ``user_id`` or ``None`` if absent.
 
@@ -79,6 +85,7 @@ def get_user(user_id):
 
 # --- Chat history ----------------------------------------------------------
 
+@log_io()
 def append_turn(conversation_id, role, text):
     """Append one conversation turn to the chat-history table."""
     now = int(time.time())
@@ -94,20 +101,53 @@ def append_turn(conversation_id, role, text):
     return item
 
 
+@log_io()
+def get_history(conversation_id):
+    """Return all turns for ``conversation_id`` in chronological order.
+
+    Each turn is ``{"role", "text", "created_at", "sk"}``. The ``sk`` sort key
+    is time-ordered, so querying with ``ScanIndexForward=True`` yields the
+    conversation oldest-first.
+    """
+    from boto3.dynamodb.conditions import Key
+
+    items = []
+    kwargs = {
+        "KeyConditionExpression": Key("conversation_id").eq(conversation_id),
+        "ScanIndexForward": True,
+    }
+    table = _chat_history_table()
+    while True:
+        response = table.query(**kwargs)
+        items.extend(response.get("Items", []))
+        last_key = response.get("LastEvaluatedKey")
+        if not last_key:
+            break
+        kwargs["ExclusiveStartKey"] = last_key
+    return items
+
+
 # --- Conversation -> workflow mapping --------------------------------------
 
-def put_mapping(conversation_id, workflow_id, user_id, whatsapp_number):
-    """Store the conversation->workflow mapping (PK ``conversation_id``)."""
+@log_io()
+def put_mapping(conversation_id, workflow_id, user_id, whatsapp_number, channel):
+    """Store the conversation->workflow mapping (PK ``conversation_id``).
+
+    ``channel`` records how the order was placed (``"whatsapp"`` or ``"api"``)
+    so the callback can route the completion message back the same way.
+    """
     item = {
         "conversation_id": conversation_id,
         "workflow_id": workflow_id,
         "user_id": user_id,
         "whatsapp_number": whatsapp_number,
+        "channel": channel,
     }
     _mapping_table().put_item(Item=item)
     return item
 
 
+@log_io()
 def get_mapping(conversation_id):
     """Return the mapping item for ``conversation_id`` or None if absent."""
     response = _mapping_table().get_item(Key={"conversation_id": conversation_id})
