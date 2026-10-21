@@ -1,0 +1,19 @@
+# Python bytecode
+*.pyc
+*.pyo
+*.pyd
+__pycache__/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Pytest cache
+.pytest_cache/
+.venv_verify/
+
+# Lambda layer build artifacts
+python/
+layer.zip
+function.zip

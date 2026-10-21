@@ -96,20 +96,76 @@ for the browser test flow to reach `/ask` and `/callback`.
 
 ## Building the layer
 
-Everything in `requirements.txt` **except boto3** goes in the layer (boto3 is
-bundled in the Python 3.12 runtime):
+The layer carries everything in `requirements.txt` **except boto3** (boto3 is
+bundled in the Python 3.12 runtime). The dependencies include native wheels
+(`pydantic-core`, `numpy`, `orjson`, ...), so the layer **must be built against
+the Linux x86_64 runtime** — a plain `pip install` on Windows/macOS produces the
+wrong binaries. Build it inside the official AWS Lambda image with Docker.
+
+### Quick build (Windows / PowerShell)
+
+```powershell
+# from src/src
+docker run --rm --entrypoint /bin/bash `
+  -v "${PWD}:/var/task" public.ecr.aws/lambda/python:3.12 `
+  -c "pip install --no-cache-dir -r requirements-layer.txt -t python/"
+# strip the runtime-bundled boto3 stack + caches and zip to layer.zip:
+powershell -ExecutionPolicy Bypass -File .\build_layer.ps1
+```
+
+`requirements-layer.txt` is `requirements.txt` without boto3. `build_layer.ps1`
+removes the bundled `boto3`/`botocore`/`s3transfer`/`jmespath`, strips
+`__pycache__`, and produces `layer.zip` (packages under a top-level `python/`
+directory, as Lambda requires).
+
+### Equivalent on macOS / Linux
 
 ```bash
-pip install -r requirements.txt -t python/
-# boto3 is runtime-bundled — remove it so it does not ship in the layer:
-rm -rf python/boto3 python/botocore python/boto3*.dist-info python/botocore*.dist-info
+docker run --rm --entrypoint /bin/bash \
+  -v "$PWD:/var/task" public.ecr.aws/lambda/python:3.12 \
+  -c "pip install --no-cache-dir -r requirements-layer.txt -t python/"
+rm -rf python/boto3* python/botocore* python/s3transfer* python/jmespath*
 zip -r layer.zip python
 ```
 
-The deployment **zip** itself contains only the `.py` modules
-(`app.py`, `agent.py`, `checkpointer.py`, `data.py`, `whatsapp.py`,
-and the reference `handler.py` / `whatsapp_lambda.py`) plus `test_page.html`;
-the third-party dependencies ship as the layer above.
+Resulting sizes: **~104 MB unzipped / ~29 MB zipped**, well under Lambda's
+250 MB unzipped limit.
+
+## Building the function zip
+
+The deployment **zip** contains only the `.py` modules plus `test_page.html`;
+the third-party dependencies come from the layer above.
+
+```powershell
+# from src/src
+Compress-Archive -Path app.py,agent.py,checkpointer.py,data.py,whatsapp.py,whatsapp_lambda.py,test_page.html `
+  -DestinationPath function.zip -CompressionLevel Optimal
+```
+
+`handler.py` is the old SQS reference and is **not** part of the new app, so it
+is omitted; `whatsapp_lambda.py` is included because `whatsapp.py` re-exports
+its helpers.
+
+## Uploading to Lambda
+
+Console route:
+
+1. **Lambda → Layers → Create layer** → upload `layer.zip`, runtime
+   *Python 3.12*, architecture *x86_64* → note the layer ARN/version.
+2. **Lambda → your function → Code** → *Upload from → .zip file* → upload
+   `function.zip`.
+3. **Function → Layers → Add a layer → Custom layers** → pick the layer above.
+4. **Runtime settings → Handler** = `app.lambda_handler`.
+5. Set the environment variables (below) and enable a public **Function URL**.
+
+CLI route (if the zips are &gt;50 MB, upload via S3 first):
+
+```bash
+aws lambda publish-layer-version --layer-name langgraph-agent-deps \
+  --zip-file fileb://layer.zip --compatible-runtimes python3.12 \
+  --compatible-architectures x86_64
+aws lambda update-function-code --function-name <fn> --zip-file fileb://function.zip
+```
 
 `requirements-dev.txt` adds `pytest` and `moto` for the offline test suite.
 Those are **dev-only** and must never be packaged into the layer or the zip.
