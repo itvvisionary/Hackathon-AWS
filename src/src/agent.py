@@ -51,13 +51,27 @@ SYSTEM_PROMPT = (
     "do the extracting. If verify_user returns authorized=false, apologise and "
     "ask them to double-check and send the ID again, then call verify_user with "
     "the new value. Do not collect any order details or call any other tool "
-    "until verify_user has returned authorized=true. Once the user is "
-    "authorized, collect all of these fields one or more at a time: user_name, "
-    "user_email, user_address, products, and number_of_products. When you have "
-    "all five fields, ask the user to confirm before placing the order, then "
-    "call the create_order tool. Use the get_current_time tool only if the user "
-    "asks about the current time. Never ask the user for their user ID again "
-    "once they are authorized."
+    "until verify_user has returned authorized=true.\n"
+    "\n"
+    "When verify_user returns authorized=true it also returns the user's stored "
+    "profile (name, email, address). Each of these may be filled or empty:\n"
+    "- For every profile field that is FILLED, do NOT ask for it from scratch. "
+    "Instead show the stored value and ask the user to confirm it or change it, "
+    "e.g. 'I'll ship to the name/email/address I have on file: <name>, <email>, "
+    "<address>. Use these, or would you like to change any of them?'\n"
+    "- For every profile field that is EMPTY (not on file), you MUST ask the "
+    "user to provide it.\n"
+    "Then collect the order itself: products and number_of_products.\n"
+    "\n"
+    "The final create_order arguments are: user_name, user_email, user_address "
+    "(each either the confirmed stored value or the new value the user gave), "
+    "plus products and number_of_products. When you have all five and the user "
+    "has confirmed the ship-to details, call the create_order tool. A "
+    "confirmation step will then show the full order and ask the user to answer "
+    "yes or no before the order is actually placed.\n"
+    "\n"
+    "Use the get_current_time tool only if the user asks about the current time. "
+    "Never ask the user for their user ID again once they are authorized."
 )
 
 
@@ -72,23 +86,49 @@ class AgentState(TypedDict):
     user_id: Optional[str]
     conversation_id: str
     whatsapp_number: str
+    # Profile prefilled from the users table at verification time. Empty string
+    # means "not stored" -> the agent must ask the user for that field.
+    profile_name: str
+    profile_email: str
+    profile_address: str
+    # Set when a confirm reply was neither yes nor no, so the graph loops back
+    # into the confirm node to re-ask for a clean yes/no.
+    reconfirm: bool
 
 
 # --- Tools -----------------------------------------------------------------
 
 
 @tool
-def verify_user(user_id: str) -> bool:
-    """Authorize a user by their ID.
+def verify_user(user_id: str) -> dict:
+    """Authorize a user by their ID and return their stored profile.
 
     The model should extract the ID token from the user's message (which may be
-    conversational, e.g. "my id is U1001") and pass just that token. Returns
-    ``True`` when the id exists in the users table, ``False`` otherwise. A
-    ``True`` result authorizes the conversation to proceed to ordering; the
-    graph records the verified id in state. No other tool may run until this
-    returns ``True``.
+    conversational, e.g. "my id is U1001") and pass just that token. Returns a
+    dict ``{"authorized": bool, "profile": {...}}``. When authorized, ``profile``
+    carries the stored ``user_name``/``user_email``/``user_address`` (any of
+    which may be empty if not on file) so the assistant can confirm the filled
+    ones with the user and only ask for the missing ones. No other tool may run
+    until this returns ``authorized=true``.
     """
-    return bool(data.is_authorized_user((user_id or "").strip()))
+    return _verify_user_lookup((user_id or "").strip())
+
+
+def _verify_user_lookup(candidate):
+    """Shared lookup used by the tool and by tools_node (for state updates)."""
+    if not candidate:
+        return {"authorized": False, "profile": {}}
+    item = data.get_user(candidate)
+    if not item:
+        return {"authorized": False, "profile": {}}
+    return {
+        "authorized": True,
+        "profile": {
+            "user_name": item.get("user_name", "") or "",
+            "user_email": item.get("user_email", "") or "",
+            "user_address": item.get("user_address", "") or "",
+        },
+    }
 
 
 @tool
@@ -207,41 +247,78 @@ def agent_node(state: AgentState) -> dict:
     return {"messages": [response]}
 
 
+def _format_order_summary(params):
+    """Build the human-readable order summary shown at the confirm step."""
+    lines = [
+        "Here is your order:",
+        "",
+        f"- Name: {params.get('user_name', '')}",
+        f"- Email: {params.get('user_email', '')}",
+        f"- Address: {params.get('user_address', '')}",
+        f"- Products: {params.get('products', '')}",
+        f"- Number of products: {params.get('number_of_products', '')}",
+        "",
+        "Please confirm you want to place this order. (enter: yes or no)",
+    ]
+    return "\n".join(lines)
+
+
 def confirm_node(state: AgentState) -> dict:
     """Pause before create_order so the user can confirm the parameters.
 
-    Raises ``interrupt`` with the collected parameters. On resume the resume
-    value is interpreted as the user's decision; anything that is not an
-    explicit affirmative cancels the order.
+    Shows the full order summary and asks the user to answer **yes or no**.
+    ``interrupt`` pauses until the user replies:
+      * an affirmative (yes/ok/confirm/...) proceeds to place the order,
+      * a clear negative (no/cancel/stop/...) cancels,
+      * anything ambiguous re-prompts (loops the interrupt) instead of
+        silently cancelling, so a stray reply never drops the order.
     """
     tool_call = _pending_create_order_call(state["messages"])
     params = dict(tool_call["args"]) if tool_call else {}
+    summary = _format_order_summary(params)
+
+    # One interrupt per entry into the node. On an ambiguous reply the node
+    # returns ``reconfirm=True`` and the graph routes straight back here, which
+    # raises a brand-new interrupt so the thread pauses again for a clean yes/no
+    # (instead of silently cancelling or placing the order).
+    if state.get("reconfirm"):
+        prompt = (
+            "Sorry, I didn't catch that - please answer 'yes' to place the "
+            "order or 'no' to cancel.\n\n" + summary
+        )
+    else:
+        prompt = summary
 
     decision = interrupt(
         {
             "type": "confirm_order",
-            "message": "Please confirm you want to place this order.",
+            "message": prompt,
             "parameters": params,
         }
     )
 
     if _is_affirmative(decision):
-        return {}
+        return {"reconfirm": False}
 
-    return {
-        "messages": [
-            ToolMessage(
-                content="Order cancelled by the user.",
-                tool_call_id=tool_call["id"] if tool_call else "cancelled",
-            ),
-            AIMessage(
-                content=(
-                    "No problem, I've cancelled that order. Let me know if you'd "
-                    "like to change anything or try again."
-                )
-            ),
-        ]
-    }
+    if _is_negative(decision):
+        return {
+            "reconfirm": False,
+            "messages": [
+                ToolMessage(
+                    content="Order cancelled by the user.",
+                    tool_call_id=tool_call["id"] if tool_call else "cancelled",
+                ),
+                AIMessage(
+                    content=(
+                        "No problem, I've cancelled that order. Let me know if "
+                        "you'd like to change anything or try again."
+                    )
+                ),
+            ],
+        }
+
+    # Ambiguous: flag for a re-ask and route back into confirm.
+    return {"reconfirm": True}
 
 
 def tools_node(state: AgentState) -> dict:
@@ -260,6 +337,7 @@ def tools_node(state: AgentState) -> dict:
     outputs = []
     authorized = bool(state.get("authorized"))
     new_user_id = None
+    new_profile = None
 
     for call in tool_calls:
         name = call["name"]
@@ -267,11 +345,11 @@ def tools_node(state: AgentState) -> dict:
 
         if name == "verify_user":
             candidate = (args.get("user_id") or "").strip()
-            ok = bool(data.is_authorized_user(candidate)) if candidate else False
-            if ok:
+            result = _verify_user_lookup(candidate)
+            if result["authorized"]:
                 authorized = True
                 new_user_id = candidate
-            result = {"authorized": ok}
+                new_profile = result["profile"]
 
         elif not authorized:
             # Gate every non-verify tool until the user is authorized.
@@ -306,6 +384,10 @@ def tools_node(state: AgentState) -> dict:
         update["authorized"] = True
     if new_user_id:
         update["user_id"] = new_user_id
+    if new_profile is not None:
+        update["profile_name"] = new_profile["user_name"]
+        update["profile_email"] = new_profile["user_email"]
+        update["profile_address"] = new_profile["user_address"]
     return update
 
 
@@ -313,12 +395,11 @@ def tools_node(state: AgentState) -> dict:
 
 
 def _pending_create_order_call(messages):
-    if not messages:
-        return None
-    last = messages[-1]
-    for call in getattr(last, "tool_calls", None) or []:
-        if call["name"] == "create_order":
-            return call
+    """Return the most recent create_order tool call in the message history."""
+    for message in reversed(messages or []):
+        for call in getattr(message, "tool_calls", None) or []:
+            if call["name"] == "create_order":
+                return call
     return None
 
 
@@ -341,6 +422,24 @@ def _is_affirmative(value):
     return False
 
 
+def _is_negative(value):
+    if value is False:
+        return True
+    if isinstance(value, str):
+        return value.strip().lower() in {
+            "no",
+            "n",
+            "nope",
+            "cancel",
+            "cancelled",
+            "canceled",
+            "stop",
+            "abort",
+            "nah",
+        }
+    return False
+
+
 def route_after_agent(state: AgentState) -> str:
     last = state["messages"][-1]
     tool_calls = getattr(last, "tool_calls", None) or []
@@ -352,7 +451,14 @@ def route_after_agent(state: AgentState) -> str:
 
 
 def route_after_confirm(state: AgentState) -> str:
-    """After confirm, run tools only if the order was not cancelled."""
+    """Route out of confirm.
+
+    * reconfirm set -> back into confirm to re-ask (ambiguous reply).
+    * cancelled (confirm appended an AIMessage, no pending tool call) -> END.
+    * confirmed -> tools, to actually place the order.
+    """
+    if state.get("reconfirm"):
+        return "confirm"
     last = state["messages"][-1]
     if isinstance(last, AIMessage) and not getattr(last, "tool_calls", None):
         return END
@@ -375,7 +481,9 @@ def build_graph(checkpointer=None):
         {"confirm": "confirm", "tools": "tools", END: END},
     )
     graph.add_conditional_edges(
-        "confirm", route_after_confirm, {"tools": "tools", END: END}
+        "confirm",
+        route_after_confirm,
+        {"confirm": "confirm", "tools": "tools", END: END},
     )
     graph.add_edge("tools", "agent")
 
@@ -449,6 +557,10 @@ def run_agent(conversation_id, user_text, whatsapp_number=""):
             "whatsapp_number": whatsapp_number,
             "authorized": False,
             "user_id": None,
+            "profile_name": "",
+            "profile_email": "",
+            "profile_address": "",
+            "reconfirm": False,
         }
     else:
         # Append only; do NOT overwrite authorized/user_id/conversation_id.

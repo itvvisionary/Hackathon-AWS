@@ -60,6 +60,17 @@ def is_authorized_user(user_id):
     return "Item" in response
 
 
+def get_user(user_id):
+    """Return the full users-table item for ``user_id`` or ``None`` if absent.
+
+    The item may carry an optional stored profile (``user_name``,
+    ``user_email``, ``user_address``) used to prefill the order's ship-to
+    details. Only ``user_id`` (the key) is guaranteed to exist.
+    """
+    response = _users_table().get_item(Key={"user_id": user_id})
+    return response.get("Item")
+
+
 # --- Chat history ----------------------------------------------------------
 
 def append_turn(conversation_id, role, text):

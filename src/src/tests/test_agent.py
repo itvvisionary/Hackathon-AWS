@@ -94,8 +94,13 @@ def mocked(monkeypatch, order_env):
     a ``set_llm`` helper so each test scripts the LLM responses it needs.
     """
 
+    # verify_user now uses data.get_user (returns the item or None). Default:
+    # an authorized user with no stored profile (all fields empty). Tests can
+    # override via harness.set_user(...).
+    get_user = MagicMock(return_value={"user_id": "U1001"})
     is_authorized = MagicMock(return_value=True)
     put_mapping = MagicMock()
+    monkeypatch.setattr(agent.data, "get_user", get_user)
     monkeypatch.setattr(agent.data, "is_authorized_user", is_authorized)
     monkeypatch.setattr(agent.data, "put_mapping", put_mapping)
 
@@ -112,9 +117,16 @@ def mocked(monkeypatch, order_env):
         pass
 
     harness = Harness()
+    harness.get_user = get_user
     harness.is_authorized = is_authorized
     harness.put_mapping = put_mapping
     harness.post = post
+
+    def set_user(item):
+        """Set the users-table item verify_user will see (None = unknown id)."""
+        get_user.return_value = item
+
+    harness.set_user = set_user
 
     def set_llm(*responses):
         # Build ONE FakeLLM and return it on every _build_llm() call so the
@@ -138,8 +150,7 @@ def _state(conversation_id):
 
 
 def test_unauthorized_id_does_not_authorize(mocked):
-    mocked.is_authorized.return_value = False
-    # LLM extracts the id and calls verify_user; the tool returns false.
+    mocked.set_user(None)  # unknown id -> verify_user returns authorized=false
     mocked.set_llm(
         _ai_verify("U-bad"),
         _ai("I couldn't verify that ID. Please double-check and send it again."),
@@ -147,7 +158,7 @@ def test_unauthorized_id_does_not_authorize(mocked):
 
     reply = agent.run_agent("conv-1", "ah, my id is U-bad")
 
-    mocked.is_authorized.assert_called_once_with("U-bad")
+    mocked.get_user.assert_called_once_with("U-bad")
     assert _state("conv-1").values.get("authorized") is not True
     assert reply
     mocked.post.assert_not_called()
@@ -158,18 +169,30 @@ def test_unauthorized_id_does_not_authorize(mocked):
 
 
 def test_authorized_id_proceeds_to_collect_params(mocked):
-    mocked.is_authorized.return_value = True
-    # verify_user call (-> true), then the agent asks for order details.
+    # Authorized user WITH a stored profile -> prefilled into state.
+    mocked.set_user(
+        {
+            "user_id": "U1001",
+            "user_name": "Ada Lovelace",
+            "user_email": "ada@example.com",
+            "user_address": "1 Analytical Engine Way",
+        }
+    )
     mocked.set_llm(
         _ai_verify("U1001"),
-        _ai("Great, you're verified. What's your name and email to start?"),
+        _ai("Great, you're verified. What would you like to order?"),
     )
 
     reply = agent.run_agent("conv-2", "my id is U1001")
 
-    mocked.is_authorized.assert_called_once_with("U1001")
-    assert _state("conv-2").values.get("authorized") is True
-    assert _state("conv-2").values.get("user_id") == "U1001"
+    mocked.get_user.assert_called_once_with("U1001")
+    values = _state("conv-2").values
+    assert values.get("authorized") is True
+    assert values.get("user_id") == "U1001"
+    # Profile loaded from the users table at verification time.
+    assert values.get("profile_name") == "Ada Lovelace"
+    assert values.get("profile_email") == "ada@example.com"
+    assert values.get("profile_address") == "1 Analytical Engine Way"
     assert reply
     mocked.post.assert_not_called()
 
@@ -178,7 +201,6 @@ def test_authorized_id_proceeds_to_collect_params(mocked):
 
 
 def test_all_params_collected_interrupts_without_post(mocked):
-    mocked.is_authorized.return_value = True
     mocked.set_llm(
         _ai_verify("U1001"),
         _ai("Thanks! I have your details."),  # after verify, collect
@@ -191,7 +213,10 @@ def test_all_params_collected_interrupts_without_post(mocked):
     reply = agent.run_agent("conv-3", "here are my details ...")
 
     assert _state("conv-3").next  # paused on the confirm interrupt
-    assert "confirm" in reply.lower()
+    # The confirm prompt shows the order summary and asks yes/no.
+    assert "yes or no" in reply.lower()
+    assert "here is your order" in reply.lower()
+    assert "Ada Lovelace" in reply  # order params appear in the summary
     mocked.post.assert_not_called()
     mocked.put_mapping.assert_not_called()
 
@@ -200,7 +225,6 @@ def test_all_params_collected_interrupts_without_post(mocked):
 
 
 def test_resume_yes_triggers_post_and_mapping(mocked):
-    mocked.is_authorized.return_value = True
     mocked.set_llm(
         _ai_verify("U1001"),
         _ai("Thanks, verified."),
@@ -229,7 +253,6 @@ def test_resume_yes_triggers_post_and_mapping(mocked):
 
 
 def test_resume_no_does_not_post(mocked):
-    mocked.is_authorized.return_value = True
     mocked.set_llm(
         _ai_verify("U1001"),
         _ai("Verified."),
@@ -244,11 +267,35 @@ def test_resume_no_does_not_post(mocked):
     mocked.put_mapping.assert_not_called()
 
 
+# --- Scenario 5b: ambiguous reply re-asks, then 'yes' places ---------------
+
+
+def test_ambiguous_confirm_reasks_then_yes_posts(mocked):
+    mocked.set_llm(
+        _ai_verify("U1001"),
+        _ai("Verified."),
+        _ai_create_order(),
+        _ai("All done!"),
+    )
+
+    agent.run_agent("conv-5b", "id: U1001")
+    agent.run_agent("conv-5b", "my details ...")
+
+    # An ambiguous reply should NOT cancel and NOT place — it re-asks.
+    reply = agent.run_agent("conv-5b", "hmm maybe")
+    assert _state("conv-5b").next  # still paused on the confirm interrupt
+    assert "yes" in reply.lower() and "no" in reply.lower()
+    mocked.post.assert_not_called()
+
+    # A clear 'yes' now places the order.
+    agent.run_agent("conv-5b", "yes")
+    mocked.post.assert_called_once()
+
+
 # --- Scenario 6: create_order before verification is gated -----------------
 
 
 def test_create_order_before_verification_is_refused(mocked):
-    mocked.is_authorized.return_value = True  # would authorize IF verify ran
     # The model (mis)behaves: it tries to order before verifying.
     mocked.set_llm(
         _ai_create_order(),
@@ -268,7 +315,6 @@ def test_create_order_before_verification_is_refused(mocked):
 
 def test_order_api_key_sets_authorization_header(mocked, monkeypatch):
     monkeypatch.setenv("ORDER_API_KEY", "secret-key")
-    mocked.is_authorized.return_value = True
     mocked.set_llm(
         _ai_verify("U1001"),
         _ai("Verified."),

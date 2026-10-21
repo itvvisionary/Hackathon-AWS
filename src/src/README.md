@@ -22,10 +22,21 @@ This directory also contains the **deployed** agent: a LangGraph ordering agent
 served through FastAPI and run on Lambda via Mangum. It greets the user, then
 authorizes them through the `verify_user` tool — the model extracts the ID from
 natural language (e.g. "my id is U1001") and the tool checks it against the
-users table, returning `true`/`false`. Until `verify_user` returns `true`,
-every other tool is blocked. Once authorized it collects the order parameters,
-interrupts to confirm, places the order through the RPA endpoint, and (on the
-callback) notifies the user over WhatsApp while recording chat history.
+users table, returning `authorized` plus any stored profile (name/email/
+address). Until `verify_user` authorizes, every other tool is blocked. Once
+authorized, the agent confirms any stored ship-to fields with the user and asks
+only for the missing ones, collects the products and quantity, then shows the
+full order and asks the user to answer **yes or no** before placing it. It
+places the order through the RPA endpoint and (on the callback) notifies the
+user over WhatsApp while recording chat history.
+
+**Profile prefill:** filled profile fields from the users table are shown for
+confirmation (not re-asked); empty/missing ones are asked for. Edits the user
+gives apply to this order only and are **not** written back to the users table.
+
+**Confirm step:** the order summary is shown and the user must reply yes/no — a
+clear yes places the order, a clear no cancels, and any ambiguous reply re-asks
+rather than silently cancelling.
 
 Authorization persists across turns: a follow-up message never resets it (only
 a brand-new conversation thread starts unauthorized).
@@ -167,6 +178,30 @@ Four tables back the agent. Create them with these key schemas:
 | `CHAT_HISTORY_TABLE_NAME` | `conversation_id` (S)   | `sk` (S)         | —                   |
 | `CHECKPOINTER_TABLE_NAME` | `pk` (S)                | `sk` (S)         | **`expires_at`**    |
 | `MAPPING_TABLE_NAME`      | `conversation_id` (S)   | —                | —                   |
+
+**Users table — optional profile attributes.** Only `user_id` (the key) is
+required. Each user item may also carry a stored profile that the agent uses to
+prefill the order's ship-to details (and confirm with the user rather than
+asking from scratch):
+
+| Attribute      | Type | Used for                                     |
+| -------------- | ---- | -------------------------------------------- |
+| `user_id`      | S    | key — authorization                          |
+| `user_name`    | S    | prefilled ship-to name (optional)            |
+| `user_email`   | S    | prefilled ship-to email (optional)           |
+| `user_address` | S    | prefilled ship-to address (optional)         |
+
+A filled profile field is shown to the user for confirmation; a missing/empty
+one is asked for normally. Example item:
+
+```json
+{
+  "user_id": "U1001",
+  "user_name": "Ada Lovelace",
+  "user_email": "ada@example.com",
+  "user_address": "1 Analytical Engine Way"
+}
+```
 
 Enable **TTL on the `expires_at` attribute** of the checkpointer table so
 LangGraph checkpoints expire automatically (items are written with
