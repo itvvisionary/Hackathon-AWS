@@ -113,7 +113,7 @@ def test_end_to_end_authorized_interrupt_resume_posts(
 
     mapping = data.get_mapping(conversation_id)
     assert mapping is not None
-    assert mapping["workflow_id"] == "wf-777"
+    assert mapping["workflow_id"] == "237436573"  # RPA id, coerced to string
     assert mapping["user_id"] == "U1001"
     assert mapping["whatsapp_number"] == whatsapp_number
 

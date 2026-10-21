@@ -85,10 +85,16 @@ def test_ask_returns_reply_and_appends_two_turns(mocked, client):
 
 
 def test_callback_composes_message_and_appends_turn_without_whatsapp(mocked, client):
+    # Mapping exists and the workflow_id matches -> accepted.
+    mocked.get_mapping.return_value = {
+        "conversation_id": "conv-2",
+        "workflow_id": "wf-2",
+    }
     res = client.post(
         "/callback",
         json={
             "conversation_id": "conv-2",
+            "workflow_id": "wf-2",
             "receipt_id": "RCPT-9",
             "total_cost": "42.50",
         },
@@ -96,20 +102,60 @@ def test_callback_composes_message_and_appends_turn_without_whatsapp(mocked, cli
     assert res.status_code == 200
     assert res.json() == {"status": "ok"}
 
+    mocked.get_mapping.assert_called_once_with("conv-2")
     expected = "Your order is complete. Receipt RCPT-9. Total cost 42.50."
     mocked.append_turn.assert_called_once_with("conv-2", "assistant", expected)
     # No WhatsApp env configured -> never attempt a send, never crash.
     mocked.send_whatsapp_message.assert_not_called()
 
 
+def test_callback_rejects_unknown_conversation(mocked, client):
+    mocked.get_mapping.return_value = None  # no mapping for this conversation
+    res = client.post(
+        "/callback",
+        json={
+            "conversation_id": "nope",
+            "workflow_id": "wf-x",
+            "receipt_id": "RCPT",
+            "total_cost": 1,
+        },
+    )
+    assert res.status_code == 404
+    mocked.append_turn.assert_not_called()
+    mocked.send_whatsapp_message.assert_not_called()
+
+
+def test_callback_rejects_workflow_id_mismatch(mocked, client):
+    mocked.get_mapping.return_value = {
+        "conversation_id": "conv-m",
+        "workflow_id": "wf-REAL",
+    }
+    res = client.post(
+        "/callback",
+        json={
+            "conversation_id": "conv-m",
+            "workflow_id": "wf-STALE",  # does not match stored wf-REAL
+            "receipt_id": "RCPT",
+            "total_cost": 1,
+        },
+    )
+    assert res.status_code == 404
+    mocked.append_turn.assert_not_called()
+    mocked.send_whatsapp_message.assert_not_called()
+
+
 def test_callback_sends_whatsapp_when_configured(mocked, client, monkeypatch):
     monkeypatch.setenv("WHATSAPP_PHONE_NUMBER_ID", "pn-123")
-    mocked.get_mapping.return_value = {"whatsapp_number": "+15551230000"}
+    mocked.get_mapping.return_value = {
+        "workflow_id": "wf-3",
+        "whatsapp_number": "+15551230000",
+    }
 
     res = client.post(
         "/callback",
         json={
             "conversation_id": "conv-3",
+            "workflow_id": "wf-3",
             "receipt_id": "RCPT-3",
             "total_cost": 10,
         },
@@ -122,13 +168,17 @@ def test_callback_sends_whatsapp_when_configured(mocked, client, monkeypatch):
 
 def test_callback_does_not_crash_when_whatsapp_send_fails(mocked, client, monkeypatch):
     monkeypatch.setenv("WHATSAPP_PHONE_NUMBER_ID", "pn-123")
-    mocked.get_mapping.return_value = {"whatsapp_number": "+15551230000"}
+    mocked.get_mapping.return_value = {
+        "workflow_id": "wf-4",
+        "whatsapp_number": "+15551230000",
+    }
     mocked.send_whatsapp_message.side_effect = RuntimeError("boom")
 
     res = client.post(
         "/callback",
         json={
             "conversation_id": "conv-4",
+            "workflow_id": "wf-4",
             "receipt_id": "RCPT-4",
             "total_cost": 1,
         },

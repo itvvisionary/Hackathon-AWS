@@ -105,7 +105,12 @@ def mocked(monkeypatch, order_env):
     monkeypatch.setattr(agent.data, "put_mapping", put_mapping)
 
     response = MagicMock()
-    response.json.return_value = {"workflow_id": "wf-777"}
+    # Real RPA response shape: the workflow id is the numeric ``id`` field.
+    response.json.return_value = {
+        "key": "687250db-0ce4-4be4-9f37-f7592962492e",
+        "state": "Pending",
+        "id": 237436573,
+    }
     response.raise_for_status.return_value = None
     post = MagicMock(return_value=response)
     monkeypatch.setattr(agent.requests, "post", post)
@@ -244,8 +249,9 @@ def test_resume_yes_triggers_post_and_mapping(mocked):
     assert body["conversation_id"] == "conv-4"
     assert "Authorization" not in kwargs["headers"]
 
+    # Workflow id is the RPA ``id`` field, coerced to a string.
     mocked.put_mapping.assert_called_once_with(
-        "conv-4", "wf-777", "U1001", "+15551230000"
+        "conv-4", "237436573", "U1001", "+15551230000"
     )
 
 

@@ -6,22 +6,36 @@
   <title>Ordering Agent Test Page</title>
   <style>
     :root { font-family: system-ui, sans-serif; }
+    * { box-sizing: border-box; }
     body { margin: 0; background: #f4f5f7; color: #1b1b1f; }
-    .wrap { max-width: 720px; margin: 0 auto; padding: 24px; }
+    .wrap { max-width: 1200px; margin: 0 auto; padding: 24px; }
     h1 { font-size: 20px; margin: 0 0 16px; }
+
+    /* Two-column layout: 60% chat (left) / 40% inputs (right). */
+    .layout { display: grid; grid-template-columns: 60% 40%; gap: 20px;
+      align-items: start; }
+    .col { display: flex; flex-direction: column; gap: 20px; }
+    @media (max-width: 860px) {
+      .layout { grid-template-columns: 1fr; }
+    }
+
     section { background: #fff; border: 1px solid #e3e5e8; border-radius: 10px;
-      padding: 16px; margin-bottom: 20px; }
+      padding: 16px; }
     h2 { font-size: 15px; margin: 0 0 12px; }
     label { display: block; font-size: 13px; margin: 10px 0 4px; color: #44474d; }
-    input { width: 100%; box-sizing: border-box; padding: 8px 10px; font-size: 14px;
+    input { width: 100%; padding: 8px 10px; font-size: 14px;
       border: 1px solid #c8cbd0; border-radius: 6px; }
     .row { display: flex; gap: 10px; }
     .row > div { flex: 1; }
     button { margin-top: 12px; padding: 8px 16px; font-size: 14px; border: none;
       border-radius: 6px; background: #2563eb; color: #fff; cursor: pointer; }
     button:hover { background: #1d4ed8; }
-    #chat { border: 1px solid #e3e5e8; border-radius: 8px; height: 320px;
-      overflow-y: auto; padding: 12px; background: #fafbfc; margin-bottom: 12px; }
+
+    /* Chat fills the taller left column. */
+    .chat-section { display: flex; flex-direction: column; }
+    #chat { border: 1px solid #e3e5e8; border-radius: 8px; height: 60vh;
+      min-height: 360px; overflow-y: auto; padding: 12px; background: #fafbfc;
+      margin-bottom: 12px; }
     .bubble { max-width: 80%; padding: 8px 12px; border-radius: 12px;
       margin: 6px 0; white-space: pre-wrap; font-size: 14px; line-height: 1.4; }
     .user { background: #2563eb; color: #fff; margin-left: auto;
@@ -40,39 +54,49 @@
   <div class="wrap">
     <h1>Ordering Agent Test Page</h1>
 
-    <section>
-      <h2>Connection</h2>
-      <label for="base">Function URL base (no trailing slash)</label>
-      <input id="base" placeholder="https://xxxxx.lambda-url.us-east-1.on.aws" />
-      <label for="conv">conversation_id</label>
-      <input id="conv" />
-      <p class="hint">Type your user ID first to get authorized, then share the
-        order details. When asked to confirm, reply <strong>yes</strong>.</p>
-    </section>
-
-    <section>
-      <h2>Chat (/ask)</h2>
-      <div id="chat"></div>
-      <div class="send-row">
-        <input id="message" placeholder="Type a message..." />
-        <button id="send">Send</button>
+    <div class="layout">
+      <!-- Left column (60%): chat -->
+      <div class="col">
+        <section class="chat-section">
+          <h2>Chat (/ask)</h2>
+          <div id="chat"></div>
+          <div class="send-row">
+            <input id="message" placeholder="Type a message..." />
+            <button id="send">Send</button>
+          </div>
+        </section>
       </div>
-    </section>
 
-    <section>
-      <h2>Callback simulator (/callback)</h2>
-      <div class="row">
-        <div>
-          <label for="receipt">receipt_id</label>
-          <input id="receipt" placeholder="RCPT-123" />
-        </div>
-        <div>
-          <label for="total">total_cost</label>
-          <input id="total" placeholder="49.99" />
-        </div>
+      <!-- Right column (40%): inputs -->
+      <div class="col">
+        <section>
+          <h2>Connection</h2>
+          <label for="base">Function URL base (no trailing slash)</label>
+          <input id="base" placeholder="https://xxxxx.lambda-url.us-east-1.on.aws" />
+          <label for="conv">conversation_id</label>
+          <input id="conv" />
+          <p class="hint">Type your user ID first to get authorized, then share
+            the order details. When asked to confirm, reply <strong>yes</strong>.</p>
+        </section>
+
+        <section>
+          <h2>Callback simulator (/callback)</h2>
+          <label for="workflow">workflow_id</label>
+          <input id="workflow" placeholder="wf-abc-123 (must match the order)" />
+          <div class="row">
+            <div>
+              <label for="receipt">receipt_id</label>
+              <input id="receipt" placeholder="RCPT-123" />
+            </div>
+            <div>
+              <label for="total">total_cost</label>
+              <input id="total" placeholder="49.99" />
+            </div>
+          </div>
+          <button id="callback">Send callback</button>
+        </section>
       </div>
-      <button id="callback">Send callback</button>
-    </section>
+    </div>
   </div>
 
   <script>
@@ -127,6 +151,7 @@
       var base = baseUrl();
       if (!base) { addBubble("system", "Set the Function URL base first."); return; }
       var conv = document.getElementById("conv").value;
+      var workflow = document.getElementById("workflow").value.trim();
       var receipt = document.getElementById("receipt").value.trim();
       var total = document.getElementById("total").value.trim();
 
@@ -136,6 +161,7 @@
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             conversation_id: conv,
+            workflow_id: workflow,
             receipt_id: receipt,
             total_cost: total
           })

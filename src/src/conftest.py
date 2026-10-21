@@ -127,10 +127,18 @@ def scripted_llm():
 
 @pytest.fixture
 def order_response():
-    """A requests.Response-like mock for the order endpoint (workflow_id)."""
+    """A requests.Response-like mock for the order endpoint.
+
+    Mirrors the real RPA response, whose workflow id is the numeric ``id``
+    field (coerced to a string by place_order).
+    """
 
     response = MagicMock()
-    response.json.return_value = {"workflow_id": "wf-777"}
+    response.json.return_value = {
+        "key": "687250db-0ce4-4be4-9f37-f7592962492e",
+        "state": "Pending",
+        "id": 237436573,
+    }
     response.raise_for_status.return_value = None
     return response
 

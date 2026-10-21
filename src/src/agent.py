@@ -152,8 +152,8 @@ def create_order(
     """Start an order workflow via the RPA order endpoint.
 
     POSTs the order details (including ``conversation_id``) to the configured
-    order API, parses the returned ``workflow_id`` and records the
-    conversation->workflow mapping. ``user_id`` and ``whatsapp_number`` are
+    order API, reads the workflow id from the response ``id`` field, and records
+    the conversation->workflow mapping. ``user_id`` and ``whatsapp_number`` are
     injected from graph state, not from the model's arguments.
     """
     return place_order(
@@ -183,7 +183,9 @@ def place_order(
 
     Separated from the ``create_order`` tool so the executing node can supply
     ``user_id``/``whatsapp_number`` from graph state rather than trusting the
-    model. Returns a dict with ``workflow_id`` and a user-facing confirmation.
+    model. The workflow id is taken from the RPA response ``id`` field (a
+    numeric id, coerced to a string). Returns a dict with ``workflow_id`` and a
+    user-facing confirmation.
     """
     endpoint = os.environ["ORDER_API_ENDPOINT"]
     body = {
@@ -210,15 +212,23 @@ def place_order(
     )
     response.raise_for_status()
     payload = response.json()
-    workflow_id = payload.get("workflow_id")
+
+    # The RPA response identifies the workflow by its ``id`` field, e.g.
+    #   {"key": "...", "state": "Pending", "id": 237436573, ...}
+    # Fall back to ``workflow_id`` for compatibility with other RPA shapes.
+    raw_id = payload.get("id")
+    if raw_id is None:
+        raw_id = payload.get("workflow_id")
+    # Store/compare the workflow id as a string (DynamoDB key + callback match).
+    workflow_id = str(raw_id) if raw_id is not None else None
 
     data.put_mapping(conversation_id, workflow_id, user_id, whatsapp_number)
 
     return {
         "workflow_id": workflow_id,
         "message": (
-            f"Your order has been started (workflow {workflow_id}). "
-            "You'll receive an update once it finishes."
+            f"Your order has been started. Your workflow ID is {workflow_id}. "
+            "You'll receive an update here once it finishes."
         ),
     }
 

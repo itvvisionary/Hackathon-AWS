@@ -77,6 +77,21 @@ Enable a **Lambda Function URL** and make it **public** (auth type `NONE`). The
 (`allow_origins=["*"]`) and the Function URL must allow unauthenticated access
 for the browser test flow to reach `/ask` and `/callback`.
 
+## HTTP endpoints
+
+| Method & path  | Request body                                                        | Response            |
+| -------------- | ------------------------------------------------------------------- | ------------------- |
+| `GET /`        | —                                                                   | the test page HTML  |
+| `POST /ask`    | `{ "conversation_id": str, "message": str }`                        | `{ "reply", "conversation_id" }` |
+| `POST /callback` | `{ "conversation_id": str, "workflow_id": str, "receipt_id": str, "total_cost": any }` | `{ "status": "ok" }` |
+
+**Callback matching.** The mapping table is keyed on `conversation_id`. The
+callback must also send the `workflow_id` returned by `create_order`: the hook
+loads the mapping by `conversation_id` and verifies its stored `workflow_id`
+matches the one in the request. A missing mapping or a mismatched `workflow_id`
+returns **404** and does not message the user — so a stale or wrong workflow
+completion is ignored.
+
 ## Building the layer
 
 The layer carries everything in `requirements.txt` **except boto3** (boto3 is
@@ -170,29 +185,36 @@ Those are **dev-only** and must never be packaged into the layer or the zip.
 
 ## DynamoDB tables
 
-Four tables back the agent. Create them with these key schemas:
+Four tables back the agent. Names come from the env vars above; keys and
+attributes are below. All tables work fine with **on-demand (PAY_PER_REQUEST)**
+capacity. Only the **users** table needs manual data (see *Seeding dummy data*);
+the agent writes the other three at runtime.
 
-| Table (env var)           | Partition key (HASH)    | Sort key (RANGE) | TTL                 |
-| ------------------------- | ----------------------- | ---------------- | ------------------- |
-| `USERS_TABLE_NAME`        | `user_id` (S)           | —                | —                   |
-| `CHAT_HISTORY_TABLE_NAME` | `conversation_id` (S)   | `sk` (S)         | —                   |
-| `CHECKPOINTER_TABLE_NAME` | `pk` (S)                | `sk` (S)         | **`expires_at`**    |
-| `MAPPING_TABLE_NAME`      | `conversation_id` (S)   | —                | —                   |
+### Key schemas (create these in the console)
 
-**Users table — optional profile attributes.** Only `user_id` (the key) is
-required. Each user item may also carry a stored profile that the agent uses to
-prefill the order's ship-to details (and confirm with the user rather than
-asking from scratch):
+| Table (env var)           | Partition key (HASH)    | Sort key (RANGE) | TTL              |
+| ------------------------- | ----------------------- | ---------------- | ---------------- |
+| `USERS_TABLE_NAME`        | `user_id` (S)           | —                | —                |
+| `CHAT_HISTORY_TABLE_NAME` | `conversation_id` (S)   | `sk` (S)         | —                |
+| `CHECKPOINTER_TABLE_NAME` | `pk` (S)                | `sk` (S)         | **`expires_at`** |
+| `MAPPING_TABLE_NAME`      | `conversation_id` (S)   | —                | —                |
 
-| Attribute      | Type | Used for                                     |
-| -------------- | ---- | -------------------------------------------- |
-| `user_id`      | S    | key — authorization                          |
-| `user_name`    | S    | prefilled ship-to name (optional)            |
-| `user_email`   | S    | prefilled ship-to email (optional)           |
-| `user_address` | S    | prefilled ship-to address (optional)         |
+Enable **TTL on the `expires_at` attribute** of the checkpointer table so
+LangGraph checkpoints expire automatically (items are written with
+`expires_at = now + 7 days`).
 
-A filled profile field is shown to the user for confirmation; a missing/empty
-one is asked for normally. Example item:
+### 1. Users table (`USERS_TABLE_NAME`)
+
+Authorization + optional stored profile. Only `user_id` (the key) is required;
+the profile fields are optional — a filled one is confirmed with the user, a
+missing one is asked for.
+
+| Attribute      | Type | Required | Notes                                      |
+| -------------- | ---- | -------- | ------------------------------------------ |
+| `user_id`      | S    | yes      | partition key; the ID the user types       |
+| `user_name`    | S    | no       | prefilled ship-to name                     |
+| `user_email`   | S    | no       | prefilled ship-to email                    |
+| `user_address` | S    | no       | prefilled ship-to address                  |
 
 ```json
 {
@@ -203,9 +225,133 @@ one is asked for normally. Example item:
 }
 ```
 
-Enable **TTL on the `expires_at` attribute** of the checkpointer table so
-LangGraph checkpoints expire automatically (items are written with
-`expires_at = now + 7 days`).
+### 2. Chat history table (`CHAT_HISTORY_TABLE_NAME`)
+
+Written by the app (`data.append_turn`) on every user and assistant turn. You
+do not seed this.
+
+| Attribute         | Type | Notes                                             |
+| ----------------- | ---- | ------------------------------------------------- |
+| `conversation_id` | S    | partition key                                     |
+| `sk`              | S    | sort key — `"<epoch_ms>-<uuid8>"`, chronological  |
+| `role`            | S    | `"user"` or `"assistant"`                         |
+| `text`            | S    | the message text                                  |
+| `created_at`      | N    | epoch seconds                                     |
+
+```json
+{
+  "conversation_id": "conv-ab12cd34",
+  "sk": "1760000000123-a1b2c3d4",
+  "role": "assistant",
+  "text": "Your order is complete. Receipt RCPT-9. Total cost 42.50.",
+  "created_at": 1760000000
+}
+```
+
+### 3. Checkpointer table (`CHECKPOINTER_TABLE_NAME`)
+
+Managed entirely by `DynamoDBSaver` (LangGraph state). You create the table
+(keys + TTL) but never write items by hand.
+
+| Attribute              | Type | Notes                                              |
+| ---------------------- | ---- | -------------------------------------------------- |
+| `pk`                   | S    | partition key — `"<thread_id>::<checkpoint_ns>"` (thread_id = `conversation_id`) |
+| `sk`                   | S    | sort key — `"checkpoint::<id>"` or `"write::<id>::<task>::<idx>"` |
+| `expires_at`           | N    | **TTL attribute** — now + 7 days                   |
+| `checkpoint`, `metadata`, `type`, `channel`, `task_id`, … | — | serialized state written by the saver |
+
+### 4. Mapping table (`MAPPING_TABLE_NAME`)
+
+Written by `create_order` (`data.put_mapping`) and read by `POST /callback`. You
+do not seed this.
+
+| Attribute         | Type | Notes                                              |
+| ----------------- | ---- | -------------------------------------------------- |
+| `conversation_id` | S    | partition key                                      |
+| `workflow_id`     | S    | returned by the RPA; the callback must echo it     |
+| `user_id`         | S    | the verified user                                  |
+| `whatsapp_number` | S    | where the callback sends the completion message    |
+
+```json
+{
+  "conversation_id": "conv-ab12cd34",
+  "workflow_id": "wf-abc-123",
+  "user_id": "U1001",
+  "whatsapp_number": "+201001234567"
+}
+```
+
+## Seeding dummy data
+
+Only the **users** table needs seeding — it is the authorization source. The
+chat-history, checkpointer, and mapping tables are populated automatically by
+the app at runtime, so leave them empty.
+
+### Option A — AWS Console
+
+1. Open the users table → **Explore table items** → **Create item**.
+2. Switch to **JSON** view and paste an item (add/remove profile fields as you
+   like — only `user_id` is required):
+
+   ```json
+   {
+     "user_id": "U1001",
+     "user_name": "Ada Lovelace",
+     "user_email": "ada@example.com",
+     "user_address": "1 Analytical Engine Way"
+   }
+   ```
+3. **Create item**. Repeat for each test user. The ID the user types in chat
+   must match `user_id` **exactly** (it is case-sensitive, trimmed only).
+
+### Option B — AWS CLI (`put-item`)
+
+Replace `<users-table>` with your actual table name:
+
+```bash
+aws dynamodb put-item --table-name <users-table> --item '{
+  "user_id":      {"S": "U1001"},
+  "user_name":    {"S": "Ada Lovelace"},
+  "user_email":   {"S": "ada@example.com"},
+  "user_address": {"S": "1 Analytical Engine Way"}
+}'
+
+# A user with no stored profile (the agent will ask for name/email/address):
+aws dynamodb put-item --table-name <users-table> --item '{
+  "user_id": {"S": "U1002"}
+}'
+```
+
+### Option C — AWS CLI (`batch-write-item`)
+
+Create `users-seed.json`:
+
+```json
+{
+  "<users-table>": [
+    { "PutRequest": { "Item": {
+      "user_id":      {"S": "U1001"},
+      "user_name":    {"S": "Ada Lovelace"},
+      "user_email":   {"S": "ada@example.com"},
+      "user_address": {"S": "1 Analytical Engine Way"}
+    }}},
+    { "PutRequest": { "Item": {
+      "user_id":      {"S": "U1002"},
+      "user_name":    {"S": "Alan Turing"},
+      "user_email":   {"S": "alan@example.com"}
+    }}}
+  ]
+}
+```
+
+Then:
+
+```bash
+aws dynamodb batch-write-item --request-items file://users-seed.json
+```
+
+> Note: `U1002` above omits `user_address`, so the agent will ask for the
+> address during ordering while prefilling the name and email.
 
 ## Local testing
 

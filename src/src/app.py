@@ -17,7 +17,7 @@ hardcoded; WhatsApp sends are gated on the ``WHATSAPP_PHONE_NUMBER_ID`` env var.
 import logging
 import os
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from mangum import Mangum
@@ -54,6 +54,7 @@ class AskRequest(BaseModel):
 
 class CallbackRequest(BaseModel):
     conversation_id: str
+    workflow_id: str
     receipt_id: str
     total_cost: object
 
@@ -81,20 +82,37 @@ def ask(body: AskRequest):
 def callback(body: CallbackRequest):
     """Third-party workflow completion hook.
 
-    Composes the receipt/total message, optionally pushes it to WhatsApp (only
-    when the origination phone number is configured and a mapping with a
-    WhatsApp number exists), and always records the assistant turn. Never
-    crashes when WhatsApp env/number is absent.
+    The mapping table is keyed on ``conversation_id``; the callback also carries
+    the ``workflow_id`` so we can confirm this completion belongs to the order
+    we recorded (and reject a stale/mismatched workflow). On a match it composes
+    the receipt/total message, optionally pushes it to WhatsApp (only when the
+    origination phone number is configured and a mapping with a WhatsApp number
+    exists), and records the assistant turn. Never crashes when WhatsApp
+    env/number is absent.
     """
+    mapping = data.get_mapping(body.conversation_id)
+
+    # Match on conversation_id AND workflow_id. A missing mapping or a
+    # workflow_id that doesn't match the recorded one is rejected (404), so a
+    # callback for a different/stale workflow never messages the user.
+    if not mapping:
+        LOG.warning("Callback for unknown conversation %s", body.conversation_id)
+        raise HTTPException(status_code=404, detail="conversation not found")
+    if mapping.get("workflow_id") != body.workflow_id:
+        LOG.warning(
+            "Callback workflow_id mismatch for conversation %s (got %s, stored %s)",
+            body.conversation_id,
+            body.workflow_id,
+            mapping.get("workflow_id"),
+        )
+        raise HTTPException(status_code=404, detail="workflow_id does not match")
+
     text = (
         f"Your order is complete. Receipt {body.receipt_id}. "
         f"Total cost {body.total_cost}."
     )
 
-    mapping = data.get_mapping(body.conversation_id)
-    if os.environ.get("WHATSAPP_PHONE_NUMBER_ID") and mapping and mapping.get(
-        "whatsapp_number"
-    ):
+    if os.environ.get("WHATSAPP_PHONE_NUMBER_ID") and mapping.get("whatsapp_number"):
         try:
             whatsapp.send_whatsapp_message(mapping["whatsapp_number"], text)
         except Exception:  # noqa: BLE001 - WhatsApp delivery must not break the hook

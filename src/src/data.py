@@ -31,8 +31,14 @@ def _resource():
 
 
 def _table(env_var):
-    """Return a cached Table handle for the table named by ``env_var``."""
-    name = os.environ[env_var]
+    """Return a cached Table handle for the table named by ``env_var``.
+
+    The name is ``.strip()``-ed so a stray leading/trailing space in the
+    environment variable (easy to introduce when pasting into the Lambda
+    console) does not reach DynamoDB, whose table names forbid spaces
+    (pattern ``[a-zA-Z0-9_.-]+``).
+    """
+    name = os.environ[env_var].strip()
     cached = _tables.get(name)
     if cached is None:
         cached = _resource().Table(name)

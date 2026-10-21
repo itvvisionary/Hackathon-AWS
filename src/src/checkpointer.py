@@ -46,7 +46,7 @@ class DynamoDBSaver(BaseCheckpointSaver):
 
     def __init__(self, table_name=None, serde=None, region_name=None):
         super().__init__(serde=serde)
-        self.table_name = table_name or os.environ["CHECKPOINTER_TABLE_NAME"]
+        self.table_name = (table_name or os.environ["CHECKPOINTER_TABLE_NAME"]).strip()
         region = region_name or os.environ.get("AWS_REGION", "us-east-1")
         self._dynamodb = boto3.resource("dynamodb", region_name=region)
         self.table = self._dynamodb.Table(self.table_name)
