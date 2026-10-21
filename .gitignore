@@ -15,5 +15,5 @@ env/
 
 # Lambda layer build artifacts
 python/
-layer.zip
-function.zip
+*.zip
+*.rar

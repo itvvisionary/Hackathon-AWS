@@ -130,9 +130,15 @@ def place_order(
         "conversation_id": conversation_id,
     }
     headers = {"Content-Type": "application/json"}
-    api_key = os.environ.get("ORDER_API_KEY")
+    # Always attach a bearer Authorization header when an API key is configured.
+    # Accept the token with or without an explicit "Bearer " prefix so the env
+    # value can be either "<token>" or "Bearer <token>" without double-prefixing.
+    api_key = (os.environ.get("ORDER_API_KEY") or "").strip()
     if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
+        if api_key.lower().startswith("bearer "):
+            headers["Authorization"] = api_key
+        else:
+            headers["Authorization"] = f"Bearer {api_key}"
 
     response = requests.post(
         endpoint, json=body, headers=headers, timeout=ORDER_API_TIMEOUT

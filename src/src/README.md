@@ -58,10 +58,10 @@ the typed ID against the users table, collects the order parameters, interrupts
 to confirm, places the order through the RPA endpoint, and (on the callback)
 notifies the user over WhatsApp while recording chat history.
 
-`handler.py` and `whatsapp_lambda.py` remain in this directory as **reference
-only** — they are the original SNS→SQS sample. They are *not* the deployed
-entry point and are left unchanged. The agent's helpers import the proven
-WhatsApp send/extract functions from `whatsapp_lambda.py` verbatim.
+The original SNS→SQS reference sample (`handler.py` and `whatsapp_lambda.py`)
+has been moved to `../old/` and is kept for reference only. It is *not* part of
+the deployed app. The WhatsApp send/extract logic now lives directly in
+`whatsapp.py` (self-contained — it no longer imports from `whatsapp_lambda.py`).
 
 ## Modules
 
@@ -71,7 +71,7 @@ WhatsApp send/extract functions from `whatsapp_lambda.py` verbatim.
 | `agent.py`       | LangGraph graph, `get_current_time` / `create_order` tools, HITL interrupt, `run_agent` |
 | `checkpointer.py`| `DynamoDBSaver(BaseCheckpointSaver)` — LangGraph state persistence       |
 | `data.py`        | Env-driven access to the four DynamoDB tables                           |
-| `whatsapp.py`    | Thin re-export of `whatsapp_lambda.py` helpers                          |
+| `whatsapp.py`    | Self-contained WhatsApp send/extract helpers (End User Messaging Social) |
 | `test_page.html` | Vanilla-JS local test UI (opened from `file://`)                        |
 
 ## Lambda handler path
@@ -138,13 +138,13 @@ the third-party dependencies come from the layer above.
 
 ```powershell
 # from src/src
-Compress-Archive -Path app.py,agent.py,checkpointer.py,data.py,whatsapp.py,whatsapp_lambda.py,test_page.html `
+Compress-Archive -Path app.py,agent.py,checkpointer.py,data.py,whatsapp.py,test_page.html `
   -DestinationPath function.zip -CompressionLevel Optimal
 ```
 
-`handler.py` is the old SQS reference and is **not** part of the new app, so it
-is omitted; `whatsapp_lambda.py` is included because `whatsapp.py` re-exports
-its helpers.
+The old reference files (`handler.py`, `whatsapp_lambda.py`) now live in
+`../old/` and are **not** part of the deployment. `whatsapp.py` is
+self-contained, so nothing else is needed.
 
 ## Uploading to Lambda
 
