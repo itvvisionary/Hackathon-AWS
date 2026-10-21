@@ -2,8 +2,11 @@
 
 The graph implements the ordering flow both triggers share:
 
-1. Welcome + ask for the user ID; gate on ``data.is_authorized_user`` before
-   anything else. An unknown ID is politely refused and re-asked.
+1. Welcome + ask for the user ID. The LLM extracts the ID from whatever the
+   user types (e.g. "my id is U1001") and calls the ``verify_user`` tool. The
+   tool returns ``True`` when the id exists in the users table, which flips the
+   conversation to authorized; otherwise it returns ``False`` and the assistant
+   asks again. Until authorized, every OTHER tool call is blocked.
 2. Once authorized, collect the order parameters (user_name, user_email,
    user_address, products, number_of_products).
 3. Before the ``create_order`` tool runs, pause with ``interrupt(...)`` so the
@@ -13,9 +16,11 @@ The graph implements the ordering flow both triggers share:
    conversation_id in the body), parses the workflow_id, and records the
    conversation->workflow mapping via ``data.put_mapping``.
 
-``user_id`` and ``whatsapp_number`` are taken from graph state (never from
-LLM-supplied tool arguments) when the order is placed. Every setting comes from
-the environment; nothing is hardcoded.
+Authorization is enforced in ``tools_node``: before the user is verified only
+``verify_user`` may run; any other tool is refused with a message telling the
+model to authorize first. ``user_id`` and ``whatsapp_number`` are taken from
+graph state (never from LLM-supplied tool arguments) when the order is placed.
+Every setting comes from the environment; nothing is hardcoded.
 """
 
 import datetime
@@ -40,13 +45,19 @@ ORDER_API_TIMEOUT = 30
 SYSTEM_PROMPT = (
     "You are a friendly ordering assistant. Start every new conversation with a "
     "short welcome and ask the user for their user ID so you can authorize them. "
-    "Do not collect any order details until the user has been authorized. Once "
-    "the user is authorized, collect all of these fields one or more at a time: "
-    "user_name, user_email, user_address, products, and number_of_products. "
-    "When you have all five fields, ask the user to confirm before placing the "
-    "order, then call the create_order tool. Use the get_current_time tool only "
-    "if the user asks about the current time. Never ask the user for their "
-    "user_id again once they are authorized."
+    "The user may give the ID conversationally (for example 'my id is U1001' or "
+    "'ah, it's U1001') - extract just the ID token from their message and call "
+    "the verify_user tool with it. Do NOT ask the user to retype a bare ID; you "
+    "do the extracting. If verify_user returns authorized=false, apologise and "
+    "ask them to double-check and send the ID again, then call verify_user with "
+    "the new value. Do not collect any order details or call any other tool "
+    "until verify_user has returned authorized=true. Once the user is "
+    "authorized, collect all of these fields one or more at a time: user_name, "
+    "user_email, user_address, products, and number_of_products. When you have "
+    "all five fields, ask the user to confirm before placing the order, then "
+    "call the create_order tool. Use the get_current_time tool only if the user "
+    "asks about the current time. Never ask the user for their user ID again "
+    "once they are authorized."
 )
 
 
@@ -64,6 +75,20 @@ class AgentState(TypedDict):
 
 
 # --- Tools -----------------------------------------------------------------
+
+
+@tool
+def verify_user(user_id: str) -> bool:
+    """Authorize a user by their ID.
+
+    The model should extract the ID token from the user's message (which may be
+    conversational, e.g. "my id is U1001") and pass just that token. Returns
+    ``True`` when the id exists in the users table, ``False`` otherwise. A
+    ``True`` result authorizes the conversation to proceed to ordering; the
+    graph records the verified id in state. No other tool may run until this
+    returns ``True``.
+    """
+    return bool(data.is_authorized_user((user_id or "").strip()))
 
 
 @tool
@@ -158,7 +183,7 @@ def place_order(
     }
 
 
-TOOLS = [get_current_time, create_order]
+TOOLS = [verify_user, get_current_time, create_order]
 TOOLS_BY_NAME = {t.name: t for t in TOOLS}
 
 
@@ -172,45 +197,6 @@ def _build_llm():
 
 
 # --- Nodes -----------------------------------------------------------------
-
-
-def _last_human_text(messages):
-    for message in reversed(messages):
-        if isinstance(message, HumanMessage):
-            return message.content if isinstance(message.content, str) else ""
-    return ""
-
-
-def authorize_node(state: AgentState) -> dict:
-    """Validate the typed user ID before any ordering can happen."""
-    if state.get("authorized"):
-        return {}
-
-    candidate = _last_human_text(state["messages"]).strip()
-    if candidate and data.is_authorized_user(candidate):
-        return {
-            "authorized": True,
-            "user_id": candidate,
-            "messages": [
-                AIMessage(
-                    content=(
-                        "Thanks, you're verified. I can help you place an order. "
-                        "To get started, what's your name?"
-                    )
-                )
-            ],
-        }
-
-    return {
-        "messages": [
-            AIMessage(
-                content=(
-                    "I couldn't verify that ID. Please double-check and send me "
-                    "your user ID again so I can authorize you."
-                )
-            )
-        ]
-    }
 
 
 def agent_node(state: AgentState) -> dict:
@@ -261,17 +247,43 @@ def confirm_node(state: AgentState) -> dict:
 def tools_node(state: AgentState) -> dict:
     """Execute the tools requested by the last AI message.
 
+    Authorization gate: until the conversation is authorized, the only tool
+    allowed to run is ``verify_user``. Any other tool call is refused with a
+    ToolMessage telling the model to authorize first. ``verify_user`` returning
+    ``True`` flips ``authorized`` and records the verified ``user_id`` in state.
+
     For ``create_order`` the identity fields (user_id, whatsapp_number) and the
     conversation_id come from graph state, not the model's tool arguments.
     """
     last = state["messages"][-1]
     tool_calls = getattr(last, "tool_calls", None) or []
     outputs = []
+    authorized = bool(state.get("authorized"))
+    new_user_id = None
 
     for call in tool_calls:
         name = call["name"]
         args = dict(call.get("args", {}))
-        if name == "create_order":
+
+        if name == "verify_user":
+            candidate = (args.get("user_id") or "").strip()
+            ok = bool(data.is_authorized_user(candidate)) if candidate else False
+            if ok:
+                authorized = True
+                new_user_id = candidate
+            result = {"authorized": ok}
+
+        elif not authorized:
+            # Gate every non-verify tool until the user is authorized.
+            result = {
+                "error": "not_authorized",
+                "message": (
+                    "The user is not authorized yet. Ask for their user ID and "
+                    "call verify_user first."
+                ),
+            }
+
+        elif name == "create_order":
             result = place_order(
                 user_name=args.get("user_name"),
                 user_email=args.get("user_email"),
@@ -279,16 +291,22 @@ def tools_node(state: AgentState) -> dict:
                 products=args.get("products"),
                 number_of_products=args.get("number_of_products"),
                 conversation_id=state["conversation_id"],
-                user_id=state.get("user_id"),
+                user_id=state.get("user_id") or new_user_id,
                 whatsapp_number=state.get("whatsapp_number", ""),
             )
+
         else:
             result = TOOLS_BY_NAME[name].invoke(args)
 
         content = result if isinstance(result, str) else json.dumps(result)
         outputs.append(ToolMessage(content=content, tool_call_id=call["id"]))
 
-    return {"messages": outputs}
+    update = {"messages": outputs}
+    if authorized and not state.get("authorized"):
+        update["authorized"] = True
+    if new_user_id:
+        update["user_id"] = new_user_id
+    return update
 
 
 # --- Routing helpers -------------------------------------------------------
@@ -323,10 +341,6 @@ def _is_affirmative(value):
     return False
 
 
-def route_after_authorize(state: AgentState) -> str:
-    return "agent" if state.get("authorized") else END
-
-
 def route_after_agent(state: AgentState) -> str:
     last = state["messages"][-1]
     tool_calls = getattr(last, "tool_calls", None) or []
@@ -350,15 +364,11 @@ def route_after_confirm(state: AgentState) -> str:
 
 def build_graph(checkpointer=None):
     graph = StateGraph(AgentState)
-    graph.add_node("authorize", authorize_node)
     graph.add_node("agent", agent_node)
     graph.add_node("confirm", confirm_node)
     graph.add_node("tools", tools_node)
 
-    graph.add_edge(START, "authorize")
-    graph.add_conditional_edges(
-        "authorize", route_after_authorize, {"agent": "agent", END: END}
-    )
+    graph.add_edge(START, "agent")
     graph.add_conditional_edges(
         "agent",
         route_after_agent,
@@ -417,22 +427,34 @@ def run_agent(conversation_id, user_text, whatsapp_number=""):
     """Advance the conversation one turn and return the text to show the user.
 
     If the thread is paused on an interrupt, ``user_text`` resumes it via
-    ``Command(resume=...)``; otherwise a new turn is started.
+    ``Command(resume=...)``. For a brand-new thread the full initial state is
+    seeded (authorized=False). For an existing, non-paused thread only the new
+    human message (and a refreshed whatsapp_number) is appended — the
+    ``authorized``/``user_id`` channels are preserved so authorization persists
+    across turns and is never reset by a follow-up message.
     """
     config = {"configurable": {"thread_id": conversation_id}}
 
     if _is_paused(config):
         compiled_graph.invoke(Command(resume=user_text), config)
-    else:
-        compiled_graph.invoke(
-            {
-                "messages": [HumanMessage(content=user_text)],
-                "conversation_id": conversation_id,
-                "whatsapp_number": whatsapp_number,
-                "authorized": False,
-                "user_id": None,
-            },
-            config,
-        )
+        return _latest_text(config)
 
+    existing = compiled_graph.get_state(config)
+    is_new_thread = not existing.values
+
+    if is_new_thread:
+        payload = {
+            "messages": [HumanMessage(content=user_text)],
+            "conversation_id": conversation_id,
+            "whatsapp_number": whatsapp_number,
+            "authorized": False,
+            "user_id": None,
+        }
+    else:
+        # Append only; do NOT overwrite authorized/user_id/conversation_id.
+        payload = {"messages": [HumanMessage(content=user_text)]}
+        if whatsapp_number:
+            payload["whatsapp_number"] = whatsapp_number
+
+    compiled_graph.invoke(payload, config)
     return _latest_text(config)

@@ -5,17 +5,14 @@ config:
 ---
 graph TD;
 	__start__([<p>__start__</p>]):::first
-	authorize(authorize)
 	agent(agent)
 	confirm(confirm)
 	tools(tools)
 	__end__([<p>__end__</p>]):::last
-	__start__ --> authorize;
+	__start__ --> agent;
 	agent -.-> __end__;
 	agent -.-> confirm;
 	agent -.-> tools;
-	authorize -.-> __end__;
-	authorize -.-> agent;
 	confirm -.-> __end__;
 	confirm -.-> tools;
 	tools --> agent;

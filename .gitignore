@@ -6,8 +6,10 @@ __pycache__/
 
 # Virtual environments
 .venv/
+.venv_test/
 venv/
 env/
+*.log
 
 # Pytest cache
 .pytest_cache/
@@ -17,3 +19,5 @@ env/
 python/
 *.zip
 *.rar
+
+layers/

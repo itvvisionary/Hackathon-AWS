@@ -36,6 +36,13 @@ ORDER_ARGS = {
 }
 
 
+def _ai_verify(user_id):
+    return AIMessage(
+        content="Checking that ID.",
+        tool_calls=[{"name": "verify_user", "args": {"user_id": user_id}, "id": "verify-1"}],
+    )
+
+
 def _ai_create_order():
     return AIMessage(
         content="Placing your order now.",
@@ -57,15 +64,24 @@ def test_end_to_end_authorized_interrupt_resume_posts(
     dynamodb, monkeypatch, order_env, mock_requests_post
 ):
     # Seed an authorized user in the real (moto) users table.
-    dynamodb.Table(USERS_TABLE_NAME).put_item(Item={"user_id": "u-123"})
+    dynamodb.Table(USERS_TABLE_NAME).put_item(Item={"user_id": "U1001"})
 
-    # Script the Bedrock LLM: first turn emits the create_order tool call
-    # (which pauses on the confirm interrupt); after resume it wraps up.
-    monkeypatch.setattr(
-        agent,
-        "_build_llm",
-        lambda: _ScriptedLLM([_ai_create_order(), AIMessage(content="All done!")]),
+    # Script the Bedrock LLM for the tool-driven flow:
+    #   turn 1: verify_user (-> authorized), then collect prompt;
+    #   turn 2: create_order (-> confirm interrupt);
+    #   after resume: wrap-up message.
+    # Build ONE scripted LLM reused on every _build_llm() call so responses
+    # advance across the tool loops (a fresh instance per call would replay
+    # verify_user forever and never terminate).
+    scripted_llm = _ScriptedLLM(
+        [
+            _ai_verify("U1001"),
+            AIMessage(content="You're verified. Share your order details."),
+            _ai_create_order(),
+            AIMessage(content="All done!"),
+        ]
     )
+    monkeypatch.setattr(agent, "_build_llm", lambda: scripted_llm)
 
     # Use the real DynamoDB checkpointer so the paused thread survives the gap
     # between the two run_agent calls.
@@ -75,8 +91,12 @@ def test_end_to_end_authorized_interrupt_resume_posts(
     conversation_id = "conv-int-1"
     whatsapp_number = "+15551230000"
 
-    # Turn 1: authorize + collect -> pauses on confirm interrupt, no POST yet.
-    reply = agent.run_agent(conversation_id, "u-123", whatsapp_number=whatsapp_number)
+    # Turn 1: natural-language id -> verify_user authorizes, agent asks for details.
+    agent.run_agent(conversation_id, "hi, my id is U1001", whatsapp_number=whatsapp_number)
+    mock_requests_post.assert_not_called()
+
+    # Turn 2: user supplies details -> create_order -> pauses on confirm interrupt.
+    reply = agent.run_agent(conversation_id, "here are my order details")
     assert "confirm" in reply.lower()
     mock_requests_post.assert_not_called()
     assert data.get_mapping(conversation_id) is None
@@ -84,7 +104,7 @@ def test_end_to_end_authorized_interrupt_resume_posts(
     state = graph.get_state({"configurable": {"thread_id": conversation_id}})
     assert state.next  # thread genuinely paused in the checkpointer table
 
-    # Turn 2: resume "yes" -> the order POST fires and the mapping is persisted.
+    # Turn 3: resume "yes" -> the order POST fires and the mapping is persisted.
     agent.run_agent(conversation_id, "yes")
 
     mock_requests_post.assert_called_once()
@@ -94,7 +114,7 @@ def test_end_to_end_authorized_interrupt_resume_posts(
     mapping = data.get_mapping(conversation_id)
     assert mapping is not None
     assert mapping["workflow_id"] == "wf-777"
-    assert mapping["user_id"] == "u-123"
+    assert mapping["user_id"] == "U1001"
     assert mapping["whatsapp_number"] == whatsapp_number
 
 
@@ -106,6 +126,8 @@ class _ScriptedLLM:
         return self
 
     def invoke(self, _messages):
+        if not self._responses:
+            return AIMessage(content="(no further action)")
         return self._responses.pop(0)
 
 

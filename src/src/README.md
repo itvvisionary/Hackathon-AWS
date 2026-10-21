@@ -1,62 +1,34 @@
 # Sample Lambda application (`src/`)
 
-This is a **reference** message-processor for the pipeline:
+This directory holds the **deployed** LangGraph + FastAPI agent Lambda. The
+original SNS→SQS Bedrock reference sample (`handler.py`, `whatsapp_lambda.py`)
+has moved to `../old/` and is no longer part of this app — its old environment
+variables (`BEDROCK_ENABLED`, `BEDROCK_MODE`, `BEDROCK_AGENT_ID`,
+`BEDROCK_AGENT_ALIAS`, `DYNAMODB_TABLE_NAME`, `RPA_API_ENDPOINT`,
+`RPA_SECRET_ARN`) do **not** apply here.
 
-```
-SNS -> SQS -> (this Lambda) -> DynamoDB + Amazon Bedrock -> external RPA
-```
-
-## Packaging
-
-The Terraform `message-processor` module zips this directory automatically at
-plan time (via the `archive` provider) when `lambda_package_path` is empty and
-`lambda_source_dir` points here. No manual build step is required for the sample.
-
-For a production build with third-party dependencies, build your own artifact
-and set `lambda_package_path` to its `.zip`:
-
-```bash
-# from the project root
-pip install -r src/requirements.txt -t build/
-cp src/handler.py build/
-cd build && zip -r ../lambda.zip . && cd ..
-# then: lambda_package_path = "lambda.zip"
-```
-
-## Dependencies
-
-The sample uses only `boto3` (bundled in the Lambda runtime) and the Python
-standard library, so `requirements.txt` is intentionally empty.
-
-## Configuration (environment variables, set by Terraform)
-
-| Variable              | Purpose                                             |
-| --------------------- | --------------------------------------------------- |
-| `DYNAMODB_TABLE_NAME` | Conversation table name                             |
-| `BEDROCK_ENABLED`     | `true`/`false` master switch                        |
-| `BEDROCK_MODE`        | `model` or `agent`                                  |
-| `BEDROCK_MODEL_ID`    | Foundation/inference-profile model ID (model mode)  |
-| `BEDROCK_AGENT_ID`    | Agent ID (agent mode)                               |
-| `BEDROCK_AGENT_ALIAS` | Agent alias ID (agent mode)                         |
-| `RPA_API_ENDPOINT`    | External RPA HTTP endpoint                          |
-| `RPA_SECRET_ARN`      | Secrets Manager ARN holding RPA credentials         |
-| `LOG_LEVEL`           | Python log level                                    |
-
-## What you must customise
-
-- `_extract_message` — map your actual WhatsApp webhook payload shape.
-- `_invoke_bedrock_model` — adjust the request body for your chosen model family.
-- `invoke_rpa` — implement the real RPA call/contract.
+> **No `BEDROCK_MODE`.** The old sample had a `model`-vs-`agent` switch because
+> it could call either a foundation model or a Bedrock Agent. The deployed app
+> does neither of those directly: it drives the model through LangGraph with
+> `ChatBedrockConverse`, so there is no mode to choose. The only Bedrock setting
+> is `BEDROCK_MODEL_ID` (the model / inference-profile id). See the environment
+> table below for the complete, current list.
 
 ---
 
 # LangGraph FastAPI agent Lambda
 
 This directory also contains the **deployed** agent: a LangGraph ordering agent
-served through FastAPI and run on Lambda via Mangum. It greets the user, checks
-the typed ID against the users table, collects the order parameters, interrupts
-to confirm, places the order through the RPA endpoint, and (on the callback)
-notifies the user over WhatsApp while recording chat history.
+served through FastAPI and run on Lambda via Mangum. It greets the user, then
+authorizes them through the `verify_user` tool — the model extracts the ID from
+natural language (e.g. "my id is U1001") and the tool checks it against the
+users table, returning `true`/`false`. Until `verify_user` returns `true`,
+every other tool is blocked. Once authorized it collects the order parameters,
+interrupts to confirm, places the order through the RPA endpoint, and (on the
+callback) notifies the user over WhatsApp while recording chat history.
+
+Authorization persists across turns: a follow-up message never resets it (only
+a brand-new conversation thread starts unauthorized).
 
 The original SNS→SQS reference sample (`handler.py` and `whatsapp_lambda.py`)
 has been moved to `../old/` and is kept for reference only. It is *not* part of
@@ -68,7 +40,7 @@ the deployed app. The WhatsApp send/extract logic now lives directly in
 | File             | Role                                                                    |
 | ---------------- | ----------------------------------------------------------------------- |
 | `app.py`         | FastAPI app, CORS, `GET /`, `POST /ask`, `POST /callback`, `lambda_handler` dispatcher + SQS path |
-| `agent.py`       | LangGraph graph, `get_current_time` / `create_order` tools, HITL interrupt, `run_agent` |
+| `agent.py`       | LangGraph graph, `verify_user` / `get_current_time` / `create_order` tools, auth gate, HITL interrupt, `run_agent` |
 | `checkpointer.py`| `DynamoDBSaver(BaseCheckpointSaver)` — LangGraph state persistence       |
 | `data.py`        | Env-driven access to the four DynamoDB tables                           |
 | `whatsapp.py`    | Self-contained WhatsApp send/extract helpers (End User Messaging Social) |
