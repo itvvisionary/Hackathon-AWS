@@ -7,6 +7,7 @@ creation to first use lets tests set the environment (and start moto) before
 any AWS client is constructed.
 """
 
+import itertools
 import os
 import time
 import uuid
@@ -25,6 +26,10 @@ def _region():
 # --- Lazily created, cached boto3 handles ----------------------------------
 _dynamodb = None
 _tables = {}
+
+# Monotonic counter so turns written within the same millisecond still sort in
+# insertion order (the millisecond timestamp alone can tie).
+_seq = itertools.count()
 
 
 def _resource():
@@ -89,7 +94,13 @@ def get_user(user_id):
 def append_turn(conversation_id, role, text):
     """Append one conversation turn to the chat-history table."""
     now = int(time.time())
-    sk = f"{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}"
+    # sk sorts chronologically: millisecond timestamp (zero-padded), then a
+    # zero-padded in-process sequence to break same-millisecond ties, then a
+    # short uuid for cross-process uniqueness.
+    sk = (
+        f"{int(time.time() * 1000):013d}-"
+        f"{next(_seq):06d}-{uuid.uuid4().hex[:8]}"
+    )
     item = {
         "conversation_id": conversation_id,
         "sk": sk,

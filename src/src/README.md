@@ -84,15 +84,15 @@ for the browser test flow to reach `/ask` and `/callback`.
 | -------------- | ------------------------------------------------------------------- | ------------------- |
 | `GET /`        | —                                                                   | the test page HTML  |
 | `POST /ask`    | `{ "conversation_id": str, "message": str }`                        | `{ "reply", "conversation_id" }` |
-| `POST /callback` | `{ "conversation_id": str, "workflow_id": str, "receipt_id": str, "total_cost": any }` | `{ "status": "ok", "channel" }` |
+| `POST /callback` | `{ "conversation_id": str, "receipt_id": str, "total_cost": any }` | `{ "status": "ok", "channel" }` |
 | `GET /history?conversation_id=…` | query param `conversation_id`                     | `{ "conversation_id", "turns": [{role, text, created_at}] }` |
 
-**Callback matching.** The mapping table is keyed on `conversation_id`. The
-callback must also send the `workflow_id` returned by `create_order`: the hook
-loads the mapping by `conversation_id` and verifies its stored `workflow_id`
-matches the one in the request. A missing mapping or a mismatched `workflow_id`
-returns **404** and does not message the user — so a stale or wrong workflow
-completion is ignored.
+**Callback matching.** The mapping table is keyed on `conversation_id`, and the
+callback is matched on that alone — it sends only `conversation_id`,
+`receipt_id`, and `total_cost`. The hook loads the mapping, reads the stored
+`workflow_id` (recorded by `create_order` from the RPA response `id`), and puts
+it in the completion message: *"Here are the results for workflow &lt;id&gt;:
+Receipt …, Total cost …"*. A missing mapping returns **404**.
 
 **Channel routing.** `create_order` records a `channel` in the mapping —
 `"whatsapp"` when the conversation arrived over SQS/WhatsApp (a sender number is
@@ -279,8 +279,21 @@ Those are **dev-only** and must never be packaged into the layer or the zip.
 All modules log through `logging_setup.py`, which formats every line as:
 
 ```
-<time> <LEVEL> [<filename>:<function>:<line>] <message>
+<time> <LEVEL> [req=<request_id> ep=<endpoint_request_id>] [<filename>:<function>:<line>] <message>
 ```
+
+**Correlation ids.** Every log line carries two ids so you can trace a request:
+
+- `request_id` — the Lambda invocation id (`context.aws_request_id`), set once
+  per invocation in `lambda_handler`. Stable across all logs of that invocation.
+- `endpoint_request_id` — a per-call id set at the start of each endpoint
+  (`/ask`, `/callback`, `/history`) and per SQS record (its `messageId`). Unique
+  to that single endpoint/message so you can isolate one request's logs within a
+  warm container that served several.
+
+Both default to `-` until set. They're stored in `contextvars` and injected by a
+logging filter, so they appear on **every** line in the call chain (including
+deep in `data.py`/`agent.py`) without any per-call code.
 
 `LOG_LEVEL` (default `INFO`) controls verbosity. At `DEBUG`, each endpoint and
 key function logs its **input** and **output** data:
@@ -295,9 +308,9 @@ key function logs its **input** and **output** data:
 Example (`LOG_LEVEL=DEBUG`):
 
 ```
-2026-10-21 14:57:37 DEBUG [agent.py:run_agent:430] -> input: args=('conv-1', 'hi') kwargs={}
-2026-10-21 14:57:37 DEBUG [data.py:append_turn:88] -> input: args=('conv-1', 'user', 'hi') kwargs={}
-2026-10-21 14:57:37 DEBUG [agent.py:run_agent:430] <- output: 'Welcome! ...'
+2026-10-21 14:57:37 DEBUG [req=abc-123 ep=5f2a1c] [agent.py:run_agent:430] -> input: args=('conv-1', 'hi') kwargs={}
+2026-10-21 14:57:37 DEBUG [req=abc-123 ep=5f2a1c] [data.py:append_turn:88] -> input: args=('conv-1', 'user', 'hi') kwargs={}
+2026-10-21 14:57:37 DEBUG [req=abc-123 ep=5f2a1c] [agent.py:run_agent:430] <- output: 'Welcome! ...'
 ```
 
 ## DynamoDB tables
@@ -350,7 +363,7 @@ do not seed this.
 | Attribute         | Type | Notes                                             |
 | ----------------- | ---- | ------------------------------------------------- |
 | `conversation_id` | S    | partition key                                     |
-| `sk`              | S    | sort key — `"<epoch_ms>-<uuid8>"`, chronological  |
+| `sk`              | S    | sort key — `"<epoch_ms>-<seq>-<uuid8>"`, chronological |
 | `role`            | S    | `"user"` or `"assistant"`                         |
 | `text`            | S    | the message text                                  |
 | `created_at`      | N    | epoch seconds                                     |
@@ -358,7 +371,7 @@ do not seed this.
 ```json
 {
   "conversation_id": "conv-ab12cd34",
-  "sk": "1760000000123-a1b2c3d4",
+  "sk": "1760000000123-000042-a1b2c3d4",
   "role": "assistant",
   "text": "Your order is complete. Receipt RCPT-9. Total cost 42.50.",
   "created_at": 1760000000

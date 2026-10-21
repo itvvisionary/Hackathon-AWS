@@ -89,8 +89,6 @@
 
         <section>
           <h2>Callback simulator (/callback)</h2>
-          <label for="workflow">workflow_id</label>
-          <input id="workflow" placeholder="wf-abc-123 (must match the order)" />
           <div class="row">
             <div>
               <label for="receipt">receipt_id</label>
@@ -159,7 +157,6 @@
       var base = baseUrl();
       if (!base) { addBubble("system", "Set the Function URL base first."); return; }
       var conv = document.getElementById("conv").value;
-      var workflow = document.getElementById("workflow").value.trim();
       var receipt = document.getElementById("receipt").value.trim();
       var total = document.getElementById("total").value.trim();
 
@@ -169,7 +166,6 @@
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             conversation_id: conv,
-            workflow_id: workflow,
             receipt_id: receipt,
             total_cost: total
           })

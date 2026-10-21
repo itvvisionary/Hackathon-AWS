@@ -23,14 +23,62 @@ On AWS Lambda the runtime installs a root handler, so we configure that handler
 """
 
 import functools
+import contextvars
 import logging
 import os
+import uuid
 
-# filename:function:line makes each line traceable to its exact source.
-LOG_FORMAT = "%(asctime)s %(levelname)s [%(filename)s:%(funcName)s:%(lineno)d] %(message)s"
+# Correlation ids injected into every log line (see ContextFilter below):
+#   request_id          - the Lambda invocation id (context.aws_request_id),
+#                         stable for the whole invocation.
+#   endpoint_request_id - a per-endpoint-call id, unique to each /ask, /callback,
+#                         SQS message, etc.
+_request_id = contextvars.ContextVar("request_id", default="-")
+_endpoint_request_id = contextvars.ContextVar("endpoint_request_id", default="-")
+
+# filename:function:line makes each line traceable to its exact source;
+# req/ep carry the Lambda request id and the per-endpoint request id.
+LOG_FORMAT = (
+    "%(asctime)s %(levelname)s "
+    "[req=%(request_id)s ep=%(endpoint_request_id)s] "
+    "[%(filename)s:%(funcName)s:%(lineno)d] %(message)s"
+)
 _DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 
 _configured = False
+
+
+class _ContextFilter(logging.Filter):
+    """Attach the current request_id / endpoint_request_id to every record."""
+
+    def filter(self, record):
+        record.request_id = _request_id.get()
+        record.endpoint_request_id = _endpoint_request_id.get()
+        return True
+
+
+_context_filter = _ContextFilter()
+
+
+# --- correlation-id helpers ------------------------------------------------
+
+
+def set_request_id(request_id):
+    """Set the Lambda invocation id for all logs in this invocation."""
+    _request_id.set(request_id or "-")
+
+
+def set_endpoint_request_id(value=None):
+    """Set (or generate) the per-endpoint-call id. Returns the id used."""
+    value = value or uuid.uuid4().hex[:12]
+    _endpoint_request_id.set(value)
+    return value
+
+
+def reset_ids():
+    """Clear both correlation ids (used between SQS records / invocations)."""
+    _request_id.set("-")
+    _endpoint_request_id.set("-")
 
 
 def _level():
@@ -41,7 +89,9 @@ def configure_logging():
     """Configure the root logger's format + level once (idempotent).
 
     Works both locally (adds a StreamHandler) and on Lambda (reuses the
-    runtime-provided handler but applies our formatter and level).
+    runtime-provided handler but applies our formatter and level). The
+    correlation-id filter is attached to every handler so request_id and
+    endpoint_request_id appear on every line.
     """
     global _configured
     root = logging.getLogger()
@@ -54,11 +104,17 @@ def configure_logging():
         for handler in root.handlers:
             handler.setFormatter(formatter)
             handler.setLevel(level)
+            handler.addFilter(_context_filter)
     else:
         handler = logging.StreamHandler()
         handler.setFormatter(formatter)
         handler.setLevel(level)
+        handler.addFilter(_context_filter)
         root.addHandler(handler)
+
+    # Also filter at the logger level so records created directly (our manual
+    # LogRecord in _emit) still get the ids even if a handler lacks the filter.
+    root.addFilter(_context_filter)
 
     _configured = True
 
@@ -100,6 +156,10 @@ def _emit(log, level, message, func):
         None,
         func.__name__,          # %(funcName)s
     )
+    # Manually-built records bypass the logger filter chain, so set the
+    # correlation ids explicitly here.
+    record.request_id = _request_id.get()
+    record.endpoint_request_id = _endpoint_request_id.get()
     log.handle(record)
 
 

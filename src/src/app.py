@@ -16,16 +16,23 @@ hardcoded; WhatsApp sends are gated on the ``WHATSAPP_PHONE_NUMBER_ID`` env var.
 
 import os
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from mangum import Mangum
 from pydantic import BaseModel
 
 import agent
 import data
 import whatsapp
-from logging_setup import configure_logging, get_logger, log_io
+from logging_setup import (
+    configure_logging,
+    get_logger,
+    log_io,
+    set_endpoint_request_id,
+    set_request_id,
+)
 
 configure_logging()
 LOG = get_logger(__name__)
@@ -44,6 +51,51 @@ app.add_middleware(
 )
 
 
+# --- Exception handlers (so failures are logged, not silent) ---------------
+
+
+@app.exception_handler(RequestValidationError)
+async def _on_validation_error(request: Request, exc: RequestValidationError):
+    """Log why a 422 happened: the validation errors AND the raw request body.
+
+    FastAPI rejects a malformed body with 422 before the route runs, so without
+    this handler the endpoint's own logs never fire and the cause is invisible.
+    """
+    try:
+        raw_body = (await request.body()).decode("utf-8", errors="replace")
+    except Exception:  # noqa: BLE001 - never let logging raise
+        raw_body = "<unreadable>"
+    LOG.warning(
+        "422 validation error on %s %s: errors=%s raw_body=%r",
+        request.method,
+        request.url.path,
+        exc.errors(),
+        raw_body,
+    )
+    # Mirror FastAPI's default 422 shape so clients see the field-level detail.
+    return JSONResponse(status_code=422, content={"detail": exc.errors()})
+
+
+@app.exception_handler(Exception)
+async def _on_unhandled_error(request: Request, exc: Exception):
+    """Log any unhandled exception with a stack trace, return a JSON 500.
+
+    Intentional ``HTTPException`` responses (e.g. the callback's 404) are
+    re-raised untouched so this only turns genuinely unexpected errors — which
+    would otherwise surface as an opaque 500 with no detail — into a logged,
+    stack-traced event.
+    """
+    if isinstance(exc, HTTPException):
+        raise exc
+    LOG.exception(
+        "Unhandled error on %s %s: %s",
+        request.method,
+        request.url.path,
+        exc,
+    )
+    return JSONResponse(status_code=500, content={"detail": "internal error"})
+
+
 # --- Request bodies --------------------------------------------------------
 
 
@@ -54,7 +106,6 @@ class AskRequest(BaseModel):
 
 class CallbackRequest(BaseModel):
     conversation_id: str
-    workflow_id: str
     receipt_id: str
     total_cost: object
 
@@ -66,6 +117,7 @@ class CallbackRequest(BaseModel):
 @log_io()
 def index():
     """Serve the vanilla-JS test page that sits next to this module."""
+    set_endpoint_request_id()
     with open(_TEST_PAGE, "r", encoding="utf-8") as handle:
         return HTMLResponse(content=handle.read())
 
@@ -74,8 +126,10 @@ def index():
 @log_io()
 def ask(body: AskRequest):
     """Advance the conversation one turn and persist both turns."""
+    ep_id = set_endpoint_request_id()
     LOG.debug(
-        "ask input: conversation_id=%s message=%r", body.conversation_id, body.message
+        "ask input: endpoint_request_id=%s conversation_id=%s message=%r",
+        ep_id, body.conversation_id, body.message,
     )
     reply = agent.run_agent(body.conversation_id, body.message)
     data.append_turn(body.conversation_id, "user", body.message)
@@ -89,18 +143,20 @@ def ask(body: AskRequest):
 def callback(body: CallbackRequest):
     """Third-party workflow completion hook.
 
-    The mapping table is keyed on ``conversation_id``; the callback also carries
-    the ``workflow_id`` so we can confirm this completion belongs to the order
-    we recorded (and reject a stale/mismatched workflow). On a match it composes
-    the receipt/total message, optionally pushes it to WhatsApp (only when the
-    origination phone number is configured and a mapping with a WhatsApp number
-    exists), and records the assistant turn. Never crashes when WhatsApp
+    The mapping table is keyed on ``conversation_id``; the callback is matched on
+    that alone. The stored ``workflow_id`` (recorded by create_order) is read
+    from the mapping and included in the completion message. On a match it
+    composes the receipt/total message, optionally pushes it to WhatsApp (only
+    when the origination phone number is configured and a mapping with a WhatsApp
+    number exists), and records the assistant turn. Never crashes when WhatsApp
     env/number is absent.
     """
+    ep_id = set_endpoint_request_id()
     LOG.debug(
-        "callback input: conversation_id=%s workflow_id=%s receipt_id=%s total_cost=%r",
+        "callback input: endpoint_request_id=%s conversation_id=%s "
+        "receipt_id=%s total_cost=%r",
+        ep_id,
         body.conversation_id,
-        body.workflow_id,
         body.receipt_id,
         body.total_cost,
     )
@@ -113,18 +169,12 @@ def callback(body: CallbackRequest):
     if not mapping:
         LOG.warning("Callback for unknown conversation %s", body.conversation_id)
         raise HTTPException(status_code=404, detail="conversation not found")
-    if mapping.get("workflow_id") != body.workflow_id:
-        LOG.warning(
-            "Callback workflow_id mismatch for conversation %s (got %s, stored %s)",
-            body.conversation_id,
-            body.workflow_id,
-            mapping.get("workflow_id"),
-        )
-        raise HTTPException(status_code=404, detail="workflow_id does not match")
 
+    # The workflow id was recorded by create_order; include it in the message.
+    workflow_id = mapping.get("workflow_id")
     text = (
-        f"Your order is complete. Receipt {body.receipt_id}. "
-        f"Total cost {body.total_cost}."
+        f"Here are the results for workflow {workflow_id}: "
+        f"Receipt {body.receipt_id}. Total cost {body.total_cost}."
     )
 
     # Route the completion by the channel recorded when the order was placed.
@@ -170,6 +220,7 @@ def history(conversation_id: str):
     the order-completion message the callback stored (the UI has no server
     push). Returns turns oldest-first.
     """
+    set_endpoint_request_id()
     turns = data.get_history(conversation_id)
     return {
         "conversation_id": conversation_id,
@@ -203,6 +254,9 @@ def process_sqs_batch(event):
 
     for record in event.get("Records", []):
         message_id = record.get("messageId")
+        # Use the SQS messageId as the per-record endpoint id so every log for
+        # this record is correlated (falls back to a generated id).
+        set_endpoint_request_id(message_id)
         try:
             webhook = whatsapp.extract_webhook_data(record)
             for msg in whatsapp.extract_text_messages(webhook):
@@ -223,6 +277,8 @@ def process_sqs_batch(event):
 
 def lambda_handler(event, context):
     """Single entry point: route SQS events to the batch path, else to Mangum."""
+    # Stamp every log in this invocation with the Lambda request id.
+    set_request_id(getattr(context, "aws_request_id", "-"))
     records = event.get("Records") if isinstance(event, dict) else None
     is_sqs = bool(records and records[0].get("eventSource") == "aws:sqs")
     LOG.debug("lambda_handler input: is_sqs=%s event_keys=%s", is_sqs,
