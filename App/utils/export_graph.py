@@ -1,8 +1,8 @@
 """Export the compiled LangGraph agent graph as an image + Mermaid source.
 
-Run from src/src:  python export_graph.py
+Run from App/:  python utils/export_graph.py
 
-Writes:
+Writes (into App/):
   - agent_graph.mmd : Mermaid source (always written, no network needed)
   - agent_graph.png : PNG render (best effort; needs network via mermaid.ink,
                       or a local graphviz/pyppeteer backend)
@@ -13,6 +13,7 @@ until the graph runs), so we set placeholder env vars first.
 """
 
 import os
+import sys
 
 # Placeholder env so importing agent.py (module-scope graph build) succeeds
 # offline. No AWS/network call is made just to draw the graph.
@@ -23,11 +24,14 @@ os.environ.setdefault("MAPPING_TABLE_NAME", "placeholder-mapping")
 os.environ.setdefault("ORDER_API_ENDPOINT", "https://example.invalid/order")
 os.environ.setdefault("AWS_REGION", "us-east-1")
 
+HERE = os.path.dirname(os.path.abspath(__file__))
+APP_DIR = os.path.dirname(HERE)
+sys.path.insert(0, os.path.join(APP_DIR, "HackathonWhatsAppCode"))
+
 import agent  # noqa: E402
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-MMD_PATH = os.path.join(HERE, "agent_graph.mmd")
-PNG_PATH = os.path.join(HERE, "agent_graph.png")
+MMD_PATH = os.path.join(APP_DIR, "agent_graph.mmd")
+PNG_PATH = os.path.join(APP_DIR, "agent_graph.png")
 
 
 def main():

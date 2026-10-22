@@ -15,7 +15,7 @@ import pytest
 from moto import mock_aws
 
 # Make the worktree modules importable regardless of the pytest invocation cwd.
-sys.path.insert(0, os.path.dirname(__file__))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "HackathonWhatsAppCode"))
 
 USERS_TABLE_NAME = "test-users"
 CHAT_HISTORY_TABLE_NAME = "test-chat-history"

@@ -60,17 +60,37 @@ def extract_webhook_data(sqs_record):
 
     Handles both ``SQS -> SNS -> WhatsApp webhook`` (SNS envelope with a
     ``Message`` field) and ``SQS -> WhatsApp webhook`` delivered directly.
-    """
-    body = json.loads(sqs_record["body"])
 
-    # Handle SNS notification envelope
-    if isinstance(body, dict) and "Message" in body:
-        body = body["Message"]
-        if isinstance(body, str):
-            body = json.loads(body)
+    Returns ``None`` for bodies that are not a JSON object (for example a plain
+    text test message published from the SNS/SQS console). Such a message can
+    never succeed, so retrying it would only send it to the DLQ; the caller
+    skips it instead. A short preview is logged to show what was received.
+    """
+    raw = sqs_record.get("body") or ""
+    try:
+        body = json.loads(raw)
+
+        # Handle SNS notification envelope
+        if isinstance(body, dict) and "Message" in body:
+            body = body["Message"]
+            if isinstance(body, str):
+                body = json.loads(body)
+    except json.JSONDecodeError:
+        LOG.warning(
+            "Skipping SQS message %s: body is not JSON (length %d, starts with %r)",
+            sqs_record.get("messageId"),
+            len(raw),
+            raw[:200],
+        )
+        return None
 
     if not isinstance(body, dict):
-        raise ValueError("Webhook body is not a JSON object")
+        LOG.warning(
+            "Skipping SQS message %s: body is JSON %s, not an object",
+            sqs_record.get("messageId"),
+            type(body).__name__,
+        )
+        return None
 
     LOG.info(
         "Webhook root type: %s, keys: %s",
@@ -78,7 +98,6 @@ def extract_webhook_data(sqs_record):
         list(body.keys()),
     )
     return body
-
 
 # =========================================================
 # EXTRACT INCOMING WHATSAPP TEXT MESSAGES

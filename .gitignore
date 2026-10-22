@@ -2,22 +2,59 @@
 *.pyc
 *.pyo
 *.pyd
+*.py[cod]
 __pycache__/
 
 # Virtual environments
 .venv/
 .venv_test/
+.venv_verify/
 venv/
 env/
-*.log
 
 # Pytest cache
 .pytest_cache/
-.venv_verify/
+*.ini
 
-# Lambda layer build artifacts
+# Logs
+*.log
+crash.log
+crash.*.log
+
+# Build artifacts
+**/.build/
+build/
+App/dist/
+App/layer/dist/
 python/
+layers/
+layers-zip/
 *.zip
 *.rar
 
-layers/
+# Terraform (IaC/) — .terraform.lock.hcl intentionally committed
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+tfplan
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+.terraformrc
+terraform.rc
+*.auto.tfvars
+*.auto.tfvars.json
+terraform.tfvars
+!IaC/environments/**/terraform.tfvars
+
+# Env files
+.env
+.env.*
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

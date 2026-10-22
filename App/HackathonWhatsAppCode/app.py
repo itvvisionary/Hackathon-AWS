@@ -259,6 +259,10 @@ def process_sqs_batch(event):
         set_endpoint_request_id(message_id)
         try:
             webhook = whatsapp.extract_webhook_data(record)
+            if webhook is None:
+                # Not a WhatsApp event (e.g. plain-text console test). Already
+                # logged; let SQS delete it instead of retrying into the DLQ.
+                continue
             for msg in whatsapp.extract_text_messages(webhook):
                 sender = msg["sender"]
                 LOG.debug("sqs message input: sender=%s text=%r", sender, msg["text"])
