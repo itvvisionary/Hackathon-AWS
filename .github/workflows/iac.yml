@@ -62,14 +62,14 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
-      - name: Check required GitHub Environment settings
+      - name: Check required GitHub secrets
         env:
-          IAC_ROLE_ARN: ${{ vars.IAC_ROLE_ARN }}
-          AWS_REGION: ${{ vars.AWS_REGION }}
+          AWS_ROLE_TO_ASSUME: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          AWS_REGION: ${{ secrets.AWS_REGION }}
         run: |
           missing=0
-          for v in IAC_ROLE_ARN AWS_REGION; do
-            if [ -z "${!v}" ]; then echo "::error::Environment variable '$v' is not set on GitHub Environment '$TF_ENV'"; missing=1; fi
+          for v in AWS_ROLE_TO_ASSUME AWS_REGION; do
+            if [ -z "${!v}" ]; then echo "::error::Secret '$v' is not set (repository or GitHub Environment '$TF_ENV')"; missing=1; fi
           done
           if [ -z "$TF_VAR_order_api_key" ]; then echo "::warning::Secret ORDER_API_KEY is not set on '$TF_ENV'; ORDER_API_KEY will be empty"; fi
           exit $missing
@@ -77,8 +77,8 @@ jobs:
       - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v6
         with:
-          role-to-assume: ${{ vars.IAC_ROLE_ARN }}
-          aws-region: ${{ vars.AWS_REGION }}
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ secrets.AWS_REGION }}
           role-session-name: gha-iac-${{ github.run_id }}
 
       - name: Setup Terraform

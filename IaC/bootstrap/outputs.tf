@@ -8,11 +8,16 @@ output "state_bucket" {
 }
 
 output "github_environment_variables" {
-  description = "Per GitHub Environment: set IAC_ROLE_ARN and APP_ROLE_ARN as environment variables."
+  description = <<-EOT
+    Per GitHub Environment: AWS_ROLE_TO_ASSUME is the value for the secret of
+    the same name, used by both workflows. APP_ONLY_ROLE_ARN is the
+    least-privilege deploy role, only needed if the App workflow is later given
+    its own role secret.
+  EOT
   value = {
     for env in local.envs : env => {
-      IAC_ROLE_ARN = aws_iam_role.iac[env].arn
-      APP_ROLE_ARN = aws_iam_role.app[env].arn
+      AWS_ROLE_TO_ASSUME = aws_iam_role.iac[env].arn
+      APP_ONLY_ROLE_ARN  = aws_iam_role.app[env].arn
     }
   }
 }

@@ -79,9 +79,8 @@ output "artifacts_bucket_name" {
 }
 
 output "app_deploy_config" {
-  description = "Values to set as GitHub environment variables for the App workflow (.github/workflows/app.yml)."
+  description = "Values to set as GitHub Environment variables for the App workflow (.github/workflows/app.yml)."
   value = {
-    AWS_REGION           = data.aws_region.current.region
     LAMBDA_FUNCTION_NAME = module.message_processor.lambda_name
     LAYER_NAME           = "${local.name_prefix}-langgraph"
     ARTIFACTS_BUCKET     = aws_s3_bucket.artifacts.bucket

@@ -125,17 +125,18 @@ In the repository: **Settings → Environments**, create `dev` and `prod`, and a
 
 | Kind | Name | Value |
 | --- | --- | --- |
-| Variable | `AWS_REGION` | `us-east-1` |
-| Variable | `IAC_ROLE_ARN` | bootstrap output `github_environment_variables.<env>.IAC_ROLE_ARN` |
-| Variable | `APP_ROLE_ARN` | bootstrap output `github_environment_variables.<env>.APP_ROLE_ARN` |
+| Secret | `AWS_ROLE_TO_ASSUME` | bootstrap output `github_environment_variables.<env>.AWS_ROLE_TO_ASSUME` (used by both workflows) |
+| Secret | `AWS_REGION` | `us-east-1` |
 | Variable | `LAMBDA_FUNCTION_NAME` | `wa-ai-rpa-<env>-message-processor` |
 | Variable | `LAYER_NAME` | `wa-ai-rpa-<env>-langgraph` |
 | Variable | `ARTIFACTS_BUCKET` | `wa-ai-rpa-<env>-lambda-artifacts-<account>` |
 | Secret | `ORDER_API_KEY` | UiPath order API key |
 
-After the first IaC apply, `terraform output app_deploy_config` prints the last
-four values exactly. For `prod`, add **Required reviewers** so applies and
-deploys wait for approval.
+Set the secrets on each GitHub Environment (not as repository secrets) so dev
+and prod use their own role. The role's trust policy only accepts jobs that
+run in the matching environment. After the first IaC apply,
+`terraform output app_deploy_config` prints the three variables exactly. For
+`prod`, add **Required reviewers** so applies and deploys wait for approval.
 
 ### 3.4 First deployment order
 
