@@ -1,0 +1,113 @@
+# IaC pipeline: Terraform for everything under IaC/.
+#   pull request  -> fmt check, validate, plan (dev)
+#   push to main  -> plan + apply (dev)
+#   manual run    -> plan or apply for a chosen environment
+# Changes under App/ never trigger this workflow.
+name: IaC
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'IaC/**'
+      - '!IaC/bootstrap/**'
+      - '.github/workflows/iac.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'IaC/**'
+      - '!IaC/bootstrap/**'
+      - '.github/workflows/iac.yml'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Environment to run against
+        type: choice
+        options: [dev, prod]
+        default: dev
+      action:
+        description: plan only, or plan and apply
+        type: choice
+        options: [plan, apply]
+        default: plan
+
+permissions:
+  id-token: write # OIDC token for aws-actions/configure-aws-credentials
+  contents: read
+
+concurrency:
+  # One Terraform run per environment at a time; never cancel a running apply.
+  group: iac-${{ inputs.environment || 'dev' }}
+  cancel-in-progress: false
+
+env:
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "false"
+
+jobs:
+  terraform:
+    name: terraform (${{ inputs.environment || 'dev' }})
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment || 'dev' }}
+    defaults:
+      run:
+        working-directory: IaC
+    env:
+      TF_ENV: ${{ inputs.environment || 'dev' }}
+      # Sensitive Terraform input, stored as a GitHub Environment secret.
+      TF_VAR_order_api_key: ${{ secrets.ORDER_API_KEY }}
+      APPLY: ${{ (github.event_name == 'push' || inputs.action == 'apply') && 'true' || 'false' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Check required GitHub Environment settings
+        env:
+          IAC_ROLE_ARN: ${{ vars.IAC_ROLE_ARN }}
+          AWS_REGION: ${{ vars.AWS_REGION }}
+        run: |
+          missing=0
+          for v in IAC_ROLE_ARN AWS_REGION; do
+            if [ -z "${!v}" ]; then echo "::error::Environment variable '$v' is not set on GitHub Environment '$TF_ENV'"; missing=1; fi
+          done
+          if [ -z "$TF_VAR_order_api_key" ]; then echo "::warning::Secret ORDER_API_KEY is not set on '$TF_ENV'; ORDER_API_KEY will be empty"; fi
+          exit $missing
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.IAC_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: gha-iac-${{ github.run_id }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: 1.17.0
+          terraform_wrapper: false
+
+      - name: Format check
+        run: terraform fmt -check -recursive
+
+      - name: Init
+        run: terraform init -backend-config="environments/${TF_ENV}/backend.hcl"
+
+      - name: Validate
+        run: terraform validate
+
+      - name: Plan
+        run: terraform plan -out=tfplan -var-file="environments/${TF_ENV}/terraform.tfvars"
+
+      - name: Apply
+        if: env.APPLY == 'true'
+        run: terraform apply tfplan
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### IaC - ${TF_ENV}"
+            echo "- Trigger: ${{ github.event_name }}"
+            echo "- Applied: ${APPLY}"
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,192 @@
+# App pipeline: deploys App/ to the Lambda created by the IaC pipeline.
+#   1. Reads the function's runtime and architecture (owned by Terraform).
+#   2. Layer: if App/layer/requirements.txt or the build script changed, builds
+#      Linux wheels, uploads the zip to S3 and publishes a new layer version;
+#      otherwise reuses the existing version. Then attaches it to the function.
+#   3. Zips App/HackathonWhatsAppCode and updates the function code.
+# Terraform never touches code or layers (lifecycle ignore_changes), and this
+# workflow never touches configuration such as environment variables.
+name: App
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'App/**'
+      - '.github/workflows/app.yml'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Environment to deploy to
+        type: choice
+        options: [dev, prod]
+        default: dev
+
+permissions:
+  id-token: write # OIDC token for aws-actions/configure-aws-credentials
+  contents: read
+
+concurrency:
+  group: app-${{ inputs.environment || 'dev' }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: deploy (${{ inputs.environment || 'dev' }})
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment || 'dev' }}
+    defaults:
+      run:
+        working-directory: App
+    env:
+      APP_ENV: ${{ inputs.environment || 'dev' }}
+      FUNCTION_NAME: ${{ vars.LAMBDA_FUNCTION_NAME }}
+      LAYER_NAME: ${{ vars.LAYER_NAME }}
+      ARTIFACTS_BUCKET: ${{ vars.ARTIFACTS_BUCKET }}
+      CODE_DIR: HackathonWhatsAppCode
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Check required GitHub Environment settings
+        env:
+          APP_ROLE_ARN: ${{ vars.APP_ROLE_ARN }}
+          AWS_REGION: ${{ vars.AWS_REGION }}
+        run: |
+          missing=0
+          for v in APP_ROLE_ARN AWS_REGION FUNCTION_NAME LAYER_NAME ARTIFACTS_BUCKET; do
+            if [ -z "${!v}" ]; then echo "::error::Variable for '$v' is not set on GitHub Environment '$APP_ENV' (see 'terraform output app_deploy_config')"; missing=1; fi
+          done
+          exit $missing
+
+      - name: Syntax check application code
+        run: python3 -m compileall -q "$CODE_DIR"
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.APP_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: gha-app-${{ github.run_id }}
+
+      - name: Read function runtime and architecture
+        id: fn
+        run: |
+          cfg=$(aws lambda get-function-configuration --function-name "$FUNCTION_NAME" \
+            --query '{runtime: Runtime, arch: Architectures[0]}' --output json)
+          runtime=$(jq -r .runtime <<<"$cfg")
+          arch=$(jq -r .arch <<<"$cfg")
+          case "$runtime" in python3.*) ;; *) echo "::error::Unsupported runtime '$runtime'"; exit 1;; esac
+          echo "runtime=$runtime" >> "$GITHUB_OUTPUT"
+          echo "python=${runtime#python}" >> "$GITHUB_OUTPUT"
+          echo "arch=$arch" >> "$GITHUB_OUTPUT"
+          echo "Function $FUNCTION_NAME: $runtime / $arch"
+
+      - name: Setup Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: ${{ steps.fn.outputs.python }}
+
+      - name: Find or decide to build the layer
+        id: layer
+        env:
+          RUNTIME: ${{ steps.fn.outputs.runtime }}
+          ARCH: ${{ steps.fn.outputs.arch }}
+        run: |
+          # Fingerprint = dependency inputs + target platform. Stored as the
+          # layer version description so unchanged dependencies are reused.
+          deps_hash=$(cat layer/requirements.txt scripts/build_layer.py | sha256sum | cut -c1-16)
+          fingerprint="deps:${deps_hash}:${RUNTIME}:${ARCH}"
+          existing=$(aws lambda list-layer-versions --layer-name "$LAYER_NAME" \
+            --query "LayerVersions[?Description=='${fingerprint}'] | [0].LayerVersionArn" --output text)
+          echo "fingerprint=$fingerprint" >> "$GITHUB_OUTPUT"
+          echo "s3_key=layers/${LAYER_NAME}/${deps_hash}-${RUNTIME}-${ARCH}.zip" >> "$GITHUB_OUTPUT"
+          if [ -n "$existing" ] && [ "$existing" != "None" ]; then
+            echo "Reusing $existing"
+            echo "arn=$existing" >> "$GITHUB_OUTPUT"
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Dependencies changed (or no layer yet): building a new layer version"
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build layer
+        if: steps.layer.outputs.build == 'true'
+        run: |
+          python scripts/build_layer.py \
+            --python-version "${{ steps.fn.outputs.python }}" \
+            --architecture "${{ steps.fn.outputs.arch }}" \
+            --output layer/dist/langgraph-layer.zip
+
+      - name: Upload and publish layer
+        id: publish
+        if: steps.layer.outputs.build == 'true'
+        env:
+          S3_KEY: ${{ steps.layer.outputs.s3_key }}
+          FINGERPRINT: ${{ steps.layer.outputs.fingerprint }}
+          RUNTIME: ${{ steps.fn.outputs.runtime }}
+          ARCH: ${{ steps.fn.outputs.arch }}
+        run: |
+          # aws s3 cp uploads large files in parts, and Lambda reads the zip
+          # from S3, so the ~48 MB upload never hits a request-signature expiry.
+          aws s3 cp layer/dist/langgraph-layer.zip "s3://${ARTIFACTS_BUCKET}/${S3_KEY}" --only-show-errors
+          arn=$(aws lambda publish-layer-version \
+            --layer-name "$LAYER_NAME" \
+            --description "$FINGERPRINT" \
+            --content "S3Bucket=${ARTIFACTS_BUCKET},S3Key=${S3_KEY}" \
+            --compatible-runtimes "$RUNTIME" \
+            --compatible-architectures "$ARCH" \
+            --query LayerVersionArn --output text)
+          echo "Published $arn"
+          echo "arn=$arn" >> "$GITHUB_OUTPUT"
+
+      - name: Attach layer to the function
+        env:
+          LAYER_ARN: ${{ steps.publish.outputs.arn || steps.layer.outputs.arn }}
+        run: |
+          current=$(aws lambda get-function-configuration --function-name "$FUNCTION_NAME" \
+            --query 'Layers[].Arn' --output json)
+          current=$(jq -c '. // []' <<<"$current") # "null" when the function has no layers
+          # Replace any version of this layer, keep every other layer as-is.
+          desired=$(jq -c --arg new "$LAYER_ARN" --arg name ":layer:${LAYER_NAME}:" \
+            '[.[] | select(contains($name) | not)] + [$new]' <<<"$current")
+          if [ "$(jq -c 'sort' <<<"$current")" = "$(jq -c 'sort' <<<"$desired")" ]; then
+            echo "Layer already attached: $LAYER_ARN"
+            exit 0
+          fi
+          aws lambda wait function-updated-v2 --function-name "$FUNCTION_NAME"
+          aws lambda update-function-configuration --function-name "$FUNCTION_NAME" \
+            --layers $(jq -r '.[]' <<<"$desired") --query LastUpdateStatus --output text
+          aws lambda wait function-updated-v2 --function-name "$FUNCTION_NAME"
+          echo "Attached $LAYER_ARN"
+
+      - name: Package application code
+        run: |
+          mkdir -p dist
+          # Libraries come from the layer; only the app's own files are shipped.
+          (cd "$CODE_DIR" && zip -r -q -X ../dist/function.zip . \
+            -x '*__pycache__*' '*.pyc' '.pytest_cache/*' 'tests/*' 'test_*.py' '*_test.py' '.env' '.env.*')
+          unzip -l dist/function.zip
+
+      - name: Deploy application code
+        run: |
+          aws lambda wait function-updated-v2 --function-name "$FUNCTION_NAME"
+          aws lambda update-function-code --function-name "$FUNCTION_NAME" \
+            --zip-file fileb://dist/function.zip --query CodeSha256 --output text
+          aws lambda wait function-updated-v2 --function-name "$FUNCTION_NAME"
+          status=$(aws lambda get-function-configuration --function-name "$FUNCTION_NAME" \
+            --query LastUpdateStatus --output text)
+          if [ "$status" != "Successful" ]; then echo "::error::Function update status: $status"; exit 1; fi
+
+      - name: Summary
+        if: always()
+        env:
+          LAYER_ARN: ${{ steps.publish.outputs.arn || steps.layer.outputs.arn }}
+        run: |
+          {
+            echo "### App - ${APP_ENV}"
+            echo "- Function: \`${FUNCTION_NAME}\`"
+            echo "- Layer: \`${LAYER_ARN:-not resolved}\` (new build: ${{ steps.layer.outputs.build || 'n/a' }})"
+            echo "- Commit: \`${GITHUB_SHA::7}\`"
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,48 @@
+# ---------------------------------------------------------------------------
+# Terraform (IaC/)
+# .terraform.lock.hcl is intentionally committed (pins provider versions).
+# ---------------------------------------------------------------------------
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+tfplan
+crash.log
+crash.*.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+.terraformrc
+terraform.rc
+
+# Local var files that may contain secrets (e.g. order_api_key)
+*.auto.tfvars
+*.auto.tfvars.json
+terraform.tfvars
+!IaC/environments/**/terraform.tfvars
+.env
+.env.*
+
+# ---------------------------------------------------------------------------
+# Build artifacts (rebuilt by the pipelines)
+# ---------------------------------------------------------------------------
+**/.build/
+build/
+App/dist/
+App/layer/dist/
+*.zip
+*.rar
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

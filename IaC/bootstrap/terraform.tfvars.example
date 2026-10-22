@@ -1,0 +1,8 @@
+# bootstrap/terraform.tfvars.example
+# Copy to terraform.tfvars (gitignored) and set your repository.
+aws_region                  = "us-east-1"
+project_name                = "wa-ai-rpa"
+environments                = ["dev", "prod"]
+github_repository           = "my-org/whatsapp-ai-rpa"
+create_github_oidc_provider = true # false if the account already has the GitHub OIDC provider
+state_bucket_name           = "state-file-hackathon-aws" # existing state bucket

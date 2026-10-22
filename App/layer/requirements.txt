@@ -1,0 +1,20 @@
+# App/layer/requirements.txt
+# Purpose: Third-party dependencies of the application in App/HackathonWhatsAppCode/,
+# pinned to exact versions for reproducible builds. Changing this file makes the
+# App pipeline build and publish a new layer version; otherwise the current
+# layer is reused. Transitive versions are recorded in dist/langgraph-layer.lock.txt.
+#
+# langgraph       - agent graph, interrupts, checkpoint base classes (agent.py, checkpointer.py)
+# langchain-core  - messages and @tool (agent.py)
+# langchain-aws   - ChatBedrockConverse (agent.py); also pulls in boto3/botocore,
+#                   newer than the runtime-bundled SDK (socialmessaging, Converse)
+# requests        - RPA order API call (agent.py)
+# fastapi         - HTTP routes /, /ask, /callback (app.py); pulls in pydantic, starlette
+# mangum          - adapts FastAPI to Lambda Function URL events (app.py)
+
+langgraph==1.2.16
+langchain-core==1.6.12
+langchain-aws==1.9.0
+requests==2.34.2
+fastapi==0.156.8
+mangum==0.22.0
