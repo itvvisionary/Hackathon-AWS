@@ -1,7 +1,7 @@
 # terraform-whatsapp-ai-rpa
 
 WhatsApp AI-agent + RPA pipeline on AWS:
-
+![alt text](WhatsApp_AI_Agent_AWS_Architecture.svg)
 ```
 Customer → WhatsApp → Amazon End User Messaging Social → SNS → SQS → Lambda → Amazon Bedrock → RPA
                                                                       │
