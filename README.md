@@ -62,7 +62,14 @@ App pipeline never changes environment variables.
 | --- | --- |
 | Pull request touching `IaC/**` | `fmt -check`, `validate`, `plan` against dev |
 | Push to `main` touching `IaC/**` | plan + apply to dev |
-| Manual run (Actions → IaC → Run workflow) | plan or apply for dev or prod |
+| Manual run (Actions → IaC → Run workflow) | plan, apply or **destroy** for dev or prod |
+
+**Destroy** deletes everything Terraform manages in that environment, including
+all DynamoDB data, plus the Lambda layer versions the App pipeline published.
+It runs only from a manual run with `action = destroy` and `confirm_destroy`
+set to the environment name (e.g. `dev`). Prod tables have deletion protection
+on, so a prod destroy stops at them until you set
+`dynamodb_deletion_protection = false` and apply first.
 
 Changes under `IaC/bootstrap/` do not trigger it (bootstrap is applied by hand).
 

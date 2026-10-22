@@ -1,7 +1,8 @@
 # IaC pipeline: Terraform for everything under IaC/.
 #   pull request  -> fmt check, validate, plan (dev)
 #   push to main  -> plan + apply (dev)
-#   manual run    -> plan or apply for a chosen environment
+#   manual run    -> plan, apply or destroy for a chosen environment
+#                    (destroy requires typing the environment name to confirm)
 # Changes under App/ never trigger this workflow.
 name: IaC
 
@@ -26,10 +27,15 @@ on:
         options: [dev, prod]
         default: dev
       action:
-        description: plan only, or plan and apply
+        description: plan only, plan and apply, or destroy everything
         type: choice
-        options: [plan, apply]
+        options: [plan, apply, destroy]
         default: plan
+      confirm_destroy:
+        description: For destroy only - type the environment name (e.g. dev) to confirm
+        type: string
+        required: false
+        default: ""
 
 permissions:
   id-token: write # OIDC token for aws-actions/configure-aws-credentials
@@ -56,11 +62,23 @@ jobs:
       TF_ENV: ${{ inputs.environment || 'dev' }}
       # Sensitive Terraform input, stored as a GitHub Environment secret.
       TF_VAR_order_api_key: ${{ secrets.ORDER_API_KEY }}
-      APPLY: ${{ (github.event_name == 'push' || inputs.action == 'apply') && 'true' || 'false' }}
+      # plan | apply | destroy. Push = apply, pull request = plan, manual = chosen input.
+      ACTION: ${{ github.event_name == 'workflow_dispatch' && inputs.action || (github.event_name == 'push' && 'apply' || 'plan') }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+
+      - name: Confirm destroy
+        if: env.ACTION == 'destroy'
+        env:
+          CONFIRM: ${{ inputs.confirm_destroy }}
+        run: |
+          if [ "$CONFIRM" != "$TF_ENV" ]; then
+            echo "::error::Destroy not confirmed. Re-run and type '$TF_ENV' in 'confirm_destroy'."
+            exit 1
+          fi
+          echo "::warning::Destroying ALL infrastructure in '$TF_ENV' (DynamoDB data, queues, Lambda, ...)."
 
       - name: Check required GitHub secrets
         env:
@@ -97,11 +115,27 @@ jobs:
         run: terraform validate
 
       - name: Plan
-        run: terraform plan -out=tfplan -var-file="environments/${TF_ENV}/terraform.tfvars"
+        run: |
+          destroy_flag=""
+          if [ "$ACTION" = "destroy" ]; then destroy_flag="-destroy"; fi
+          terraform plan $destroy_flag -out=tfplan -var-file="environments/${TF_ENV}/terraform.tfvars"
 
+      # For destroy, the saved plan is a destroy plan, so this deletes everything.
       - name: Apply
-        if: env.APPLY == 'true'
+        if: env.ACTION == 'apply' || env.ACTION == 'destroy'
         run: terraform apply tfplan
+
+      # Layer versions are published by the App pipeline, not Terraform, so
+      # terraform destroy does not remove them.
+      - name: Delete Lambda layer versions
+        if: env.ACTION == 'destroy' && vars.LAYER_NAME != ''
+        env:
+          LAYER_NAME: ${{ vars.LAYER_NAME }}
+        run: |
+          for v in $(aws lambda list-layer-versions --layer-name "$LAYER_NAME" --query 'LayerVersions[].Version' --output text); do
+            aws lambda delete-layer-version --layer-name "$LAYER_NAME" --version-number "$v"
+            echo "Deleted $LAYER_NAME:$v"
+          done
 
       - name: Summary
         if: always()
@@ -109,5 +143,5 @@ jobs:
           {
             echo "### IaC - ${TF_ENV}"
             echo "- Trigger: ${{ github.event_name }}"
-            echo "- Applied: ${APPLY}"
+            echo "- Action: ${ACTION}"
           } >> "$GITHUB_STEP_SUMMARY"
