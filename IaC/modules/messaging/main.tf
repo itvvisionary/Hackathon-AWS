@@ -12,6 +12,7 @@
 #   therefore provisions the SNS topic and the IDs are provided as inputs; the
 #   event destination is pointed at this topic as a documented manual step.
 
+data "aws_partition" "current" {}
 data "aws_caller_identity" "current" {}
 
 resource "aws_sns_topic" "inbound" {
@@ -20,33 +21,19 @@ resource "aws_sns_topic" "inbound" {
   tags              = var.tags
 }
 
-# Topic access policy (SNS console default shape). Any principal may use the
-# topic, but only when the request comes from this account (AWS:SourceAccount).
-# This covers the AWS End User Messaging Social service publishing inbound
-# WhatsApp events on behalf of this account.
+# Allow the AWS End User Messaging Social service principal to publish to the
+# topic, scoped to this account.
 data "aws_iam_policy_document" "topic_policy" {
-  version   = "2008-10-17"
-  policy_id = "__default_policy_ID"
-
   statement {
-    sid    = "__default_statement_ID"
+    sid    = "AllowSocialMessagingPublish"
     effect = "Allow"
 
     principals {
-      type        = "AWS"
-      identifiers = ["*"]
+      type        = "Service"
+      identifiers = ["social-messaging.amazonaws.com"]
     }
 
-    actions = [
-      "SNS:Publish",
-      "SNS:RemovePermission",
-      "SNS:SetTopicAttributes",
-      "SNS:DeleteTopic",
-      "SNS:ListSubscriptionsByTopic",
-      "SNS:GetTopicAttributes",
-      "SNS:AddPermission",
-      "SNS:Subscribe",
-    ]
+    actions   = ["SNS:Publish"]
     resources = [aws_sns_topic.inbound.arn]
 
     condition {
@@ -54,6 +41,25 @@ data "aws_iam_policy_document" "topic_policy" {
       variable = "AWS:SourceAccount"
       values   = [data.aws_caller_identity.current.account_id]
     }
+  }
+
+  # Allow account administrators standard management of the topic.
+  statement {
+    sid    = "AllowAccountOwnerManage"
+    effect = "Allow"
+
+    principals {
+      type        = "AWS"
+      identifiers = ["arn:${data.aws_partition.current.partition}:iam::${data.aws_caller_identity.current.account_id}:root"]
+    }
+
+    actions = [
+      "SNS:Subscribe",
+      "SNS:GetTopicAttributes",
+      "SNS:SetTopicAttributes",
+      "SNS:ListSubscriptionsByTopic",
+    ]
+    resources = [aws_sns_topic.inbound.arn]
   }
 }
 
