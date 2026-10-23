@@ -13,9 +13,9 @@ variable "tags" {
 }
 
 variable "kms_master_key_id" {
-  description = "KMS key id/alias/ARN for SNS encryption. Use 'alias/aws/sns' for the AWS-managed key."
+  description = "Customer-managed KMS key for SNS encryption, or empty for none. alias/aws/sns blocks End User Messaging Social."
   type        = string
-  default     = "alias/aws/sns"
+  default     = ""
 }
 
 variable "whatsapp_business_account_id" {

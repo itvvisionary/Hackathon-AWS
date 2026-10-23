@@ -69,9 +69,21 @@ variable "whatsapp_phone_number_id" {
 }
 
 variable "sns_kms_master_key_id" {
-  description = "KMS key id/alias/ARN for SNS topic encryption. Empty string uses the AWS-managed alias/aws/sns key."
+  description = <<-EOT
+    KMS key for SNS topic encryption. Empty string = no encryption at rest.
+    Do NOT use the AWS-managed key "alias/aws/sns": its key policy cannot be
+    edited and does not let the End User Messaging Social service use it, so
+    WhatsApp events are silently dropped. To encrypt, pass a customer-managed
+    key whose policy allows social-messaging.amazonaws.com
+    kms:GenerateDataKey* and kms:Decrypt.
+  EOT
   type        = string
-  default     = "alias/aws/sns"
+  default     = ""
+
+  validation {
+    condition     = var.sns_kms_master_key_id != "alias/aws/sns"
+    error_message = "alias/aws/sns cannot be used: End User Messaging Social cannot publish to topics encrypted with it. Use \"\" or a customer-managed KMS key."
+  }
 }
 
 # ---------------------------------------------------------------------------

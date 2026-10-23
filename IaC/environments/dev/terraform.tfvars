@@ -19,7 +19,7 @@ whatsapp_business_account_id = ""
 # belongs to the account the number is linked in; after linking the number in
 # the new account, replace it with the ID shown there.
 whatsapp_phone_number_id = "phone-number-id-7d27e7d5ef9b45bdaa18157170bc8cd3"
-sns_kms_master_key_id    = "alias/aws/sns"
+sns_kms_master_key_id    = ""      # no encryption; alias/aws/sns blocks WhatsApp events
 meta_api_version         = "v20.0" # META_API_VERSION
 
 # SQS - smaller/looser in dev.
