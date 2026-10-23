@@ -68,14 +68,24 @@ variable "whatsapp_phone_number_id" {
   default     = ""
 }
 
+variable "sns_create_kms_key" {
+  description = <<-EOT
+    Create a customer-managed KMS key for the WhatsApp inbound SNS topic, with a
+    key policy that lets End User Messaging Social encrypt the events it
+    publishes. When false, sns_kms_master_key_id is used instead.
+  EOT
+  type        = bool
+  default     = true
+}
+
 variable "sns_kms_master_key_id" {
   description = <<-EOT
-    KMS key for SNS topic encryption. Empty string = no encryption at rest.
+    Existing customer-managed KMS key for the topic, used only when
+    sns_create_kms_key = false. Empty string = no encryption at rest.
     Do NOT use the AWS-managed key "alias/aws/sns": its key policy cannot be
     edited and does not let the End User Messaging Social service use it, so
-    WhatsApp events are silently dropped. To encrypt, pass a customer-managed
-    key whose policy allows social-messaging.amazonaws.com
-    kms:GenerateDataKey* and kms:Decrypt.
+    WhatsApp events are silently dropped. The key's policy must allow
+    social-messaging.amazonaws.com kms:GenerateDataKey* and kms:Decrypt.
   EOT
   type        = string
   default     = ""

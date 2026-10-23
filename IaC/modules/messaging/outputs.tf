@@ -11,6 +11,11 @@ output "sns_topic_name" {
   value       = aws_sns_topic.inbound.name
 }
 
+output "kms_key_arn" {
+  description = "ARN of the KMS key encrypting the topic (null if unencrypted or an external key is used)."
+  value       = var.create_kms_key ? aws_kms_key.sns[0].arn : null
+}
+
 output "whatsapp_business_account_id" {
   description = "Pass-through of the linked WABA ID (reference only)."
   value       = var.whatsapp_business_account_id

@@ -15,7 +15,8 @@ tags = {
 # --- Messaging / WhatsApp (IDs come from the manual linking flow) ---
 whatsapp_business_account_id = "" # e.g. "123456789012345" after linking in the console
 whatsapp_phone_number_id     = "" # e.g. "phone-number-id-0123456789abcdef0123456789abcdef"
-sns_kms_master_key_id        = "" # never alias/aws/sns (End User Messaging Social can't use it)
+sns_create_kms_key           = true # create a customer-managed key End User Messaging Social can use
+sns_kms_master_key_id        = ""   # existing CMK if sns_create_kms_key = false; never alias/aws/sns
 meta_api_version             = "v20.0"
 
 # --- SQS ---

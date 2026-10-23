@@ -12,10 +12,32 @@ variable "tags" {
   default     = {}
 }
 
+variable "create_kms_key" {
+  description = "Create a customer-managed KMS key (with End User Messaging Social access) and encrypt the topic with it."
+  type        = bool
+  default     = true
+}
+
 variable "kms_master_key_id" {
-  description = "Customer-managed KMS key for SNS encryption, or empty for none. alias/aws/sns blocks End User Messaging Social."
+  description = <<-EOT
+    Existing customer-managed KMS key (ARN, ID or alias) used when
+    create_kms_key = false. Its key policy must allow social-messaging.amazonaws.com
+    kms:GenerateDataKey* and kms:Decrypt. Empty = no encryption.
+    alias/aws/sns blocks End User Messaging Social.
+  EOT
   type        = string
   default     = ""
+}
+
+variable "kms_deletion_window_in_days" {
+  description = "Waiting period before the created KMS key is deleted after destroy (7-30)."
+  type        = number
+  default     = 7
+
+  validation {
+    condition     = var.kms_deletion_window_in_days >= 7 && var.kms_deletion_window_in_days <= 30
+    error_message = "kms_deletion_window_in_days must be between 7 and 30."
+  }
 }
 
 variable "whatsapp_business_account_id" {

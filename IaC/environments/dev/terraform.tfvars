@@ -15,11 +15,11 @@ tags = {
 
 # Messaging / WhatsApp (fill in after the manual linking flow).
 whatsapp_business_account_id = ""
-# End User Messaging Social phone number ID (WHATSAPP_PHONE_NUMBER_ID). This ID
-# belongs to the account the number is linked in; after linking the number in
-# the new account, replace it with the ID shown there.
-whatsapp_phone_number_id = "phone-number-id-7d27e7d5ef9b45bdaa18157170bc8cd3"
-sns_kms_master_key_id    = ""      # no encryption; alias/aws/sns blocks WhatsApp events
+# End User Messaging Social phone number ID (WHATSAPP_PHONE_NUMBER_ID) of the
+# number linked in THIS account (each account assigns its own ID).
+whatsapp_phone_number_id = "phone-number-id-40bb45f602e8487aa4c1ec48da5af485"
+sns_create_kms_key       = true    # customer-managed key that End User Messaging Social may use
+sns_kms_master_key_id    = ""      # only used when sns_create_kms_key = false; never alias/aws/sns
 meta_api_version         = "v20.0" # META_API_VERSION
 
 # SQS - smaller/looser in dev.

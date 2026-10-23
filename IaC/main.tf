@@ -38,6 +38,7 @@ module "messaging" {
 
   name_prefix                  = local.name_prefix
   tags                         = local.common_tags
+  create_kms_key               = var.sns_create_kms_key
   kms_master_key_id            = var.sns_kms_master_key_id
   whatsapp_business_account_id = var.whatsapp_business_account_id
   whatsapp_phone_number_id     = var.whatsapp_phone_number_id

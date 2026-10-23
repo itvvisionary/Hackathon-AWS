@@ -15,8 +15,9 @@ tags = {
 
 # Messaging / WhatsApp (fill in after the manual linking flow).
 whatsapp_business_account_id = ""
-whatsapp_phone_number_id     = "" # phone-number-id-... of the prod-linked number
-sns_kms_master_key_id        = "" # or a customer-managed key allowing social-messaging; never alias/aws/sns
+whatsapp_phone_number_id     = ""   # phone-number-id-... of the prod-linked number
+sns_create_kms_key           = true # customer-managed key that End User Messaging Social may use
+sns_kms_master_key_id        = ""   # only used when sns_create_kms_key = false; never alias/aws/sns
 meta_api_version             = "v20.0"
 
 # SQS - production retention and generous visibility (>= 6x Lambda timeout).

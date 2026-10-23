@@ -68,6 +68,11 @@ output "bedrock_agent_id" {
   value       = module.ai_agent.agent_id
 }
 
+output "sns_kms_key_arn" {
+  description = "Customer-managed KMS key encrypting the WhatsApp inbound SNS topic (null if not created)."
+  value       = module.messaging.kms_key_arn
+}
+
 output "whatsapp_event_destination_setup" {
   description = "Human-readable reminder of the manual step to point End User Messaging Social at the SNS topic."
   value       = module.messaging.event_destination_instructions
