@@ -53,9 +53,7 @@ SYSTEM_PROMPT = (
     "Once you have the customer id, call the list_orders tool with it. A "
     "confirmation step will then ask the user to answer yes or no before the "
     "lookup actually runs.\n"
-    "\n"
-    "Use the get_current_time tool only if the user asks about the current time."
-)
+    )
 
 
 # --- Graph state -----------------------------------------------------------
