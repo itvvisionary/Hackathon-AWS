@@ -14,6 +14,7 @@ HTML page is opened from ``file://`` so CORS is fully permissive. Nothing is
 hardcoded; WhatsApp sends are gated on the ``WHATSAPP_PHONE_NUMBER_ID`` env var.
 """
 
+import datetime
 import os
 
 from fastapi import FastAPI, HTTPException, Request
@@ -170,6 +171,68 @@ def _as_list(value):
     return [part.strip() for part in str(value).split(";") if part.strip() != ""]
 
 
+def _parse_eur_number(raw):
+    """Parse a European-formatted amount ('43.409,65') to a float.
+
+    European style: '.' is the thousands separator and ',' is the decimal
+    point. Returns ``None`` if the value can't be parsed (caller keeps the raw
+    string instead of crashing).
+    """
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    if text == "":
+        return None
+    # Drop thousands dots, turn the decimal comma into a dot.
+    normalized = text.replace(".", "").replace(",", ".")
+    try:
+        return float(normalized)
+    except ValueError:
+        return None
+
+
+def _fmt_number(value):
+    """Format a float US-style: comma thousands, dot decimal, 2 places."""
+    return f"{value:,.2f}"
+
+
+def _fmt_price(raw):
+    """Reformat an EU price string to US style; fall back to the raw string."""
+    num = _parse_eur_number(raw)
+    return _fmt_number(num) if num is not None else str(raw)
+
+
+_MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+           "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+
+
+def _fmt_date(raw):
+    """Reformat 'DD.MM.YYYY' -> 'DD Mon YYYY' (e.g. '16.03.2026' -> '16 Mar 2026').
+
+    Falls back to the raw string if it doesn't match that shape.
+    """
+    if raw is None:
+        return ""
+    text = str(raw).strip()
+    parts = text.split(".")
+    if len(parts) == 3:
+        day, month, year = parts
+        try:
+            d = int(day)
+            m = int(month)
+            if 1 <= m <= 12:
+                return f"{d:02d} {_MONTHS[m - 1]} {year}"
+        except ValueError:
+            pass
+    return text
+
+
+def _title_case(raw):
+    """Title-case a customer name ('dentistry hospital' -> 'Dentistry Hospital')."""
+    text = str(raw or "").strip()
+    return text.title() if text else text
+
+
 def _compose_order_message(workflow_id, body):
     """Build the user-facing order-list message from the callback body.
 
@@ -204,13 +267,46 @@ def _compose_order_message(workflow_id, body):
             return col[0]
         return col[i] if i < len(col) else ""
 
-    lines = [f"Here are the orders for workflow {workflow_id}:"]
+    customer = _title_case(cust_name[0]) if cust_name else ""
+
+    # Header line: workflow + customer (shown once).
+    header = f"Orders — Workflow {workflow_id}"
+    if customer:
+        header += f"  Customer: {customer}"
+    lines = [header, ""]
+
+    # One numbered line per order: "N. Doc <sales> — <price> <ccy> — <date>".
+    total = 0.0
+    total_ok = True
+    currency_for_total = ""
     for i in range(max_len):
+        sales = cell(sales_docs, i)
+        price_raw = cell(net_prices, i)
+        ccy = cell(currencies, i)
+        date_raw = cell(doc_dates, i)
+
+        num = _parse_eur_number(price_raw)
+        if num is None:
+            total_ok = False
+        else:
+            total += num
+            if not currency_for_total:
+                currency_for_total = ccy
+
         lines.append(
-            f"{i + 1}) Sales doc {cell(sales_docs, i)} | "
-            f"{cell(net_prices, i)} {cell(currencies, i)} | "
-            f"customer {cell(cust_name, i)} | date {cell(doc_dates, i)}"
+            f"{i + 1}. Doc {sales} — {_fmt_price(price_raw)} {ccy} — {_fmt_date(date_raw)}"
         )
+
+    # Footer total (single-currency sum). If any price failed to parse, show the
+    # order count only rather than a misleading total.
+    lines.append("")
+    if total_ok:
+        lines.append(
+            f"Total: {_fmt_number(total)} {currency_for_total} ({max_len} orders)"
+        )
+    else:
+        lines.append(f"({max_len} orders)")
+
     return "\n".join(lines)
 
 

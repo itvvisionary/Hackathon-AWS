@@ -117,9 +117,12 @@ def test_callback_api_channel_composes_order_list(mocked, client, monkeypatch):
 
     mocked.get_mapping.assert_called_once_with("conv-2")
     expected = (
-        "Here are the orders for workflow 237436573:\n"
-        "1) Sales doc 21000232 | 43.409,65 EGP | customer Dentistry hospital | date 16.03.2026\n"
-        "2) Sales doc 21000228 | 237.420,00 EGP | customer Dentistry hospital | date 03.03.2026"
+        "Orders — Workflow 237436573  Customer: Dentistry Hospital\n"
+        "\n"
+        "1. Doc 21000232 — 43,409.65 EGP — 16 Mar 2026\n"
+        "2. Doc 21000228 — 237,420.00 EGP — 03 Mar 2026\n"
+        "\n"
+        "Total: 280,829.65 EGP (2 orders)"
     )
     mocked.append_turn.assert_called_once_with("conv-2", "assistant", expected)
     # API channel -> never send WhatsApp even though it's configured.
@@ -162,9 +165,14 @@ def test_callback_sends_whatsapp_when_configured(mocked, client, monkeypatch):
         },
     )
     assert res.status_code == 200
+    # Price "10" parses to 10.00; date "2026-03-03" isn't DD.MM.YYYY so it is
+    # shown unchanged (graceful fallback).
     expected = (
-        "Here are the orders for workflow 237436573:\n"
-        "1) Sales doc 4500003 | 10 EUR | customer Globex | date 2026-03-03"
+        "Orders — Workflow 237436573  Customer: Globex\n"
+        "\n"
+        "1. Doc 4500003 — 10.00 EUR — 2026-03-03\n"
+        "\n"
+        "Total: 10.00 EUR (1 orders)"
     )
     mocked.send_whatsapp_message.assert_called_once_with("+15551230000", expected)
     mocked.append_turn.assert_called_once_with("conv-3", "assistant", expected)
