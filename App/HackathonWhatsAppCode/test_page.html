@@ -33,8 +33,8 @@
 
     /* Chat fills the taller left column. */
     .chat-section { display: flex; flex-direction: column; }
-    #chat { border: 1px solid #e3e5e8; border-radius: 8px; height: 60vh;
-      min-height: 360px; overflow-y: auto; padding: 12px; background: #fafbfc;
+    #chat { border: 1px solid #e3e5e8; border-radius: 8px; height: 75vh;
+      min-height: 500px; overflow-y: auto; padding: 12px; background: #fafbfc;
       margin-bottom: 12px; }
     .bubble { max-width: 80%; padding: 8px 12px; border-radius: 12px;
       margin: 6px 0; white-space: pre-wrap; font-size: 14px; line-height: 1.4; }
@@ -50,6 +50,7 @@
     .hint { font-size: 12px; color: #6b6f76; margin: 6px 0 0; }
     .chat-head { display: flex; align-items: center; justify-content: space-between; }
     .chat-head h2 { margin: 0; }
+    .head-actions { display: flex; gap: 8px; }
     button.ghost { margin-top: 0; padding: 6px 12px; background: #eef1f6;
       color: #2563eb; }
     button.ghost:hover { background: #e0e5ee; }
@@ -65,7 +66,10 @@
         <section class="chat-section">
           <div class="chat-head">
             <h2>Chat (/ask)</h2>
-            <button id="load" class="ghost">Load history</button>
+            <span class="head-actions">
+              <button id="refresh" class="ghost">Refresh</button>
+              <button id="load" class="ghost">Load history</button>
+            </span>
           </div>
           <div id="chat"></div>
           <div class="send-row">
@@ -94,17 +98,18 @@
             customer_found
           </label>
           <label for="salesDocs">Sales_docs</label>
-          <input id="salesDocs" placeholder="4500001, 4500002" />
+          <input id="salesDocs" placeholder="21000232 ; 21000228 ; 21000227" />
           <label for="netPrices">Net_Prices</label>
-          <input id="netPrices" placeholder="100.00, 250.50" />
+          <input id="netPrices" placeholder="43.409,65 ; 237.420,00" />
           <label for="currencies">Currencies</label>
-          <input id="currencies" placeholder="USD, USD" />
+          <input id="currencies" placeholder="EGP ; EGP" />
           <label for="custName">Cust_Name</label>
-          <input id="custName" placeholder="Acme, Acme" />
+          <input id="custName" placeholder="Dentistry hospital" />
           <label for="docDates">Doc_dates</label>
-          <input id="docDates" placeholder="2026-01-01, 2026-02-01" />
-          <p class="hint">Each field is comma-separated; the values are zipped by
-            index into one order per position.</p>
+          <input id="docDates" placeholder="16.03.2026 ; 03.03.2026" />
+          <p class="hint">Each field is a single string with values separated by
+            " ; " (as the RPA sends them); they are zipped by index into one
+            order per position. Cust_Name may be a single name for all rows.</p>
           <button id="callback">Send callback</button>
         </section>
       </div>
@@ -159,11 +164,9 @@
       }
     }
 
-    function splitList(id) {
-      return document.getElementById(id).value
-        .split(",")
-        .map(function (s) { return s.trim(); })
-        .filter(function (s) { return s.length > 0; });
+    function fieldValue(id) {
+      // Send the raw string exactly as the RPA does (semicolon-separated).
+      return document.getElementById(id).value;
     }
 
     async function sendCallback() {
@@ -179,11 +182,11 @@
           body: JSON.stringify({
             conversation_id: conv,
             customer_found: customerFound,
-            Doc_dates: splitList("docDates"),
-            Sales_docs: splitList("salesDocs"),
-            Net_Prices: splitList("netPrices"),
-            Currencies: splitList("currencies"),
-            Cust_Name: splitList("custName")
+            Doc_dates: fieldValue("docDates"),
+            Sales_docs: fieldValue("salesDocs"),
+            Net_Prices: fieldValue("netPrices"),
+            Currencies: fieldValue("currencies"),
+            Cust_Name: fieldValue("custName")
           })
         });
         var data = await res.json();
@@ -213,6 +216,16 @@
       }
     }
 
+    function refreshChat() {
+      // Clear the chat UI and start a fresh conversation. Leaves the Function
+      // URL base untouched; only the conversation_id is regenerated.
+      chat.innerHTML = "";
+      var newId = randomId();
+      document.getElementById("conv").value = newId;
+      addBubble("system", "--- new conversation: " + newId + " ---");
+    }
+
+    document.getElementById("refresh").addEventListener("click", refreshChat);
     document.getElementById("load").addEventListener("click", loadHistory);
     document.getElementById("send").addEventListener("click", sendMessage);
     document.getElementById("message").addEventListener("keydown", function (e) {

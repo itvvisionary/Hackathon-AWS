@@ -97,16 +97,19 @@ def test_callback_api_channel_composes_order_list(mocked, client, monkeypatch):
         "workflow_id": "237436573",
         "channel": "api",
     }
+    # Real RPA shape: each field is ONE semicolon-separated string, and
+    # Cust_Name is a single party name that applies to every row. The RPA does
+    # NOT send customer_found, so it is omitted here on purpose — orders must
+    # still show (presence is derived from the data, not the flag).
     res = client.post(
         "/callback",
         json={
             "conversation_id": "conv-2",
-            "customer_found": True,
-            "Sales_docs": ["4500001", "4500002"],
-            "Net_Prices": ["100.00", "250.50"],
-            "Currencies": ["USD", "USD"],
-            "Cust_Name": ["Acme", "Acme"],
-            "Doc_dates": ["2026-01-01", "2026-02-01"],
+            "Sales_docs": "21000232 ; 21000228",
+            "Net_Prices": "43.409,65 ; 237.420,00",
+            "Currencies": "EGP ; EGP",
+            "Cust_Name": "Dentistry hospital",
+            "Doc_dates": "16.03.2026 ; 03.03.2026",
         },
     )
     assert res.status_code == 200
@@ -115,8 +118,8 @@ def test_callback_api_channel_composes_order_list(mocked, client, monkeypatch):
     mocked.get_mapping.assert_called_once_with("conv-2")
     expected = (
         "Here are the orders for workflow 237436573:\n"
-        "1) Sales doc 4500001 | 100.00 USD | customer Acme | date 2026-01-01\n"
-        "2) Sales doc 4500002 | 250.50 USD | customer Acme | date 2026-02-01"
+        "1) Sales doc 21000232 | 43.409,65 EGP | customer Dentistry hospital | date 16.03.2026\n"
+        "2) Sales doc 21000228 | 237.420,00 EGP | customer Dentistry hospital | date 03.03.2026"
     )
     mocked.append_turn.assert_called_once_with("conv-2", "assistant", expected)
     # API channel -> never send WhatsApp even though it's configured.
@@ -151,11 +154,11 @@ def test_callback_sends_whatsapp_when_configured(mocked, client, monkeypatch):
         json={
             "conversation_id": "conv-3",
             "customer_found": True,
-            "Sales_docs": ["4500003"],
-            "Net_Prices": ["10"],
-            "Currencies": ["EUR"],
-            "Cust_Name": ["Globex"],
-            "Doc_dates": ["2026-03-03"],
+            "Sales_docs": "4500003",
+            "Net_Prices": "10",
+            "Currencies": "EUR",
+            "Cust_Name": "Globex",
+            "Doc_dates": "2026-03-03",
         },
     )
     assert res.status_code == 200
@@ -195,9 +198,10 @@ def test_callback_customer_not_found_message(mocked, client):
         "workflow_id": "237436573",
         "channel": "api",
     }
+    # No order data at all -> "no orders" (derived from empty data, not a flag).
     res = client.post(
         "/callback",
-        json={"conversation_id": "conv-nf", "customer_found": False},
+        json={"conversation_id": "conv-nf"},
     )
     assert res.status_code == 200
     expected = "No orders found for the requested customer (workflow 237436573)."

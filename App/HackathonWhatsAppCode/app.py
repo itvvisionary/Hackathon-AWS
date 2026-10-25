@@ -108,19 +108,21 @@ class CallbackRequest(BaseModel):
     """Order-list result from the RPA/SAP workflow.
 
     Only ``conversation_id`` is required (matching is impossible without it).
-    Every per-order field is optional and defaults to ``[]`` so a missing field
-    does NOT 422. Each per-order field accepts either a list of strings OR a
-    single scalar/string (tolerated and wrapped into a one-element list during
-    composition).
+    Every per-order field is optional and defaults to ``""`` so a missing field
+    does NOT 422. The RPA sends each field as a SINGLE string of semicolon-
+    separated values, e.g. Sales_docs = "21000232 ; 21000228 ; 21000227"; a real
+    list is also tolerated. ``_as_list`` splits/normalizes each field, then the
+    parallel columns are zipped by index into one line per order (a single-value
+    column such as ``Cust_Name`` applies to every row).
     """
 
     conversation_id: str
     customer_found: bool = False
-    Doc_dates: object = []
-    Sales_docs: object = []
-    Net_Prices: object = []
-    Currencies: object = []
-    Cust_Name: object = []
+    Doc_dates: object = ""
+    Sales_docs: object = ""
+    Net_Prices: object = ""
+    Currencies: object = ""
+    Cust_Name: object = ""
 
 
 # --- HTTP routes -----------------------------------------------------------
@@ -154,22 +156,33 @@ def ask(body: AskRequest):
 def _as_list(value):
     """Normalize a callback field to a list of strings.
 
-    Accepts a list (coerce each cell to ``str``), a single scalar/string (wrap
-    into a one-element list), or ``None``/``""`` (treated as empty).
+    The RPA/SAP workflow sends each field as a SINGLE string with values
+    separated by semicolons, e.g.
+        "21000232 ; 21000228 ; 21000227"
+    so a string is split on ``;`` and each part trimmed. A real list is also
+    tolerated (each cell coerced to ``str``); ``None``/``""`` -> empty list.
     """
     if value is None or value == "":
         return []
     if isinstance(value, (list, tuple)):
-        return [("" if cell is None else str(cell)) for cell in value]
-    return [str(value)]
+        return [("" if cell is None else str(cell).strip()) for cell in value]
+    # Single string with semicolon-separated values.
+    return [part.strip() for part in str(value).split(";") if part.strip() != ""]
 
 
 def _compose_order_message(workflow_id, body):
     """Build the user-facing order-list message from the callback body.
 
-    Zips the five parallel per-order lists by index (using ``""`` for missing
-    cells) into one readable line per order. When the customer was not found or
-    every list is empty, returns the "no orders" message instead.
+    Zips the parallel per-order lists by index (using ``""`` for missing cells)
+    into one readable line per order.
+
+    Whether orders exist is derived from the ACTUAL data, not the
+    ``customer_found`` flag — the RPA does not reliably send that flag, so
+    relying on it hid real results. The number of orders is the max length of
+    the per-order columns (Doc_dates, Sales_docs, Net_Prices, Currencies);
+    ``Cust_Name`` is excluded from that count because it is a single party name
+    for the whole result, not one-per-order. If there are no order rows, the
+    "no orders" message is returned.
     """
     doc_dates = _as_list(body.Doc_dates)
     sales_docs = _as_list(body.Sales_docs)
@@ -177,13 +190,18 @@ def _compose_order_message(workflow_id, body):
     currencies = _as_list(body.Currencies)
     cust_name = _as_list(body.Cust_Name)
 
-    columns = [doc_dates, sales_docs, net_prices, currencies, cust_name]
-    max_len = max((len(col) for col in columns), default=0)
+    # Per-order columns only (Cust_Name is a single name, not per-order).
+    order_columns = [doc_dates, sales_docs, net_prices, currencies]
+    max_len = max((len(col) for col in order_columns), default=0)
 
-    if not body.customer_found or max_len == 0:
+    if max_len == 0:
         return f"No orders found for the requested customer (workflow {workflow_id})."
 
     def cell(col, i):
+        # A column with a single value (e.g. Cust_Name is one party name for the
+        # whole result) applies to every row; otherwise index into the column.
+        if len(col) == 1:
+            return col[0]
         return col[i] if i < len(col) else ""
 
     lines = [f"Here are the orders for workflow {workflow_id}:"]
