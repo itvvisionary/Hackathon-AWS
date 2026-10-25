@@ -18,28 +18,18 @@ variables (`BEDROCK_ENABLED`, `BEDROCK_MODE`, `BEDROCK_AGENT_ID`,
 
 # LangGraph FastAPI agent Lambda
 
-This directory also contains the **deployed** agent: a LangGraph ordering agent
-served through FastAPI and run on Lambda via Mangum. It greets the user, then
-authorizes them through the `verify_user` tool — the model extracts the ID from
-natural language (e.g. "my id is U1001") and the tool checks it against the
-users table, returning `authorized` plus any stored profile (name/email/
-address). Until `verify_user` authorizes, every other tool is blocked. Once
-authorized, the agent confirms any stored ship-to fields with the user and asks
-only for the missing ones, collects the products and quantity, then shows the
-full order and asks the user to answer **yes or no** before placing it. It
-places the order through the RPA endpoint and (on the callback) notifies the
-user over WhatsApp while recording chat history.
+This directory also contains the **deployed** agent: a LangGraph orders assistant
+served through FastAPI and run on Lambda via Mangum. It greets the user and asks
+for their **customer id** (the user simply provides it — it is **not** verified
+against any table). Once it has the id it calls the `list_orders` tool, which
+first pauses for a **yes/no** confirmation and then starts an asynchronous
+lookup against the RPA/SAP endpoint. The lookup result is delivered later via
+the `POST /callback` hook, which composes the order list and (for the WhatsApp
+channel) notifies the user while recording chat history.
 
-**Profile prefill:** filled profile fields from the users table are shown for
-confirmation (not re-asked); empty/missing ones are asked for. Edits the user
-gives apply to this order only and are **not** written back to the users table.
-
-**Confirm step:** the order summary is shown and the user must reply yes/no — a
-clear yes places the order, a clear no cancels, and any ambiguous reply re-asks
-rather than silently cancelling.
-
-Authorization persists across turns: a follow-up message never resets it (only
-a brand-new conversation thread starts unauthorized).
+**Confirm step:** before the lookup runs, the customer id is shown and the user
+must reply yes/no — a clear yes starts the lookup, a clear no cancels, and any
+ambiguous reply re-asks rather than silently cancelling.
 
 The original SNS→SQS reference sample (`handler.py` and `whatsapp_lambda.py`)
 has been moved to `../old/` and is kept for reference only. It is *not* part of
@@ -51,9 +41,9 @@ the deployed app. The WhatsApp send/extract logic now lives directly in
 | File             | Role                                                                    |
 | ---------------- | ----------------------------------------------------------------------- |
 | `app.py`         | FastAPI app, CORS, `GET /`, `POST /ask`, `POST /callback`, `lambda_handler` dispatcher + SQS path |
-| `agent.py`       | LangGraph graph, `verify_user` / `get_current_time` / `create_order` tools, auth gate, HITL interrupt, `run_agent` |
+| `agent.py`       | LangGraph graph, `get_current_time` / `list_orders` tools, HITL interrupt, `run_agent` |
 | `checkpointer.py`| `DynamoDBSaver(BaseCheckpointSaver)` — LangGraph state persistence       |
-| `data.py`        | Env-driven access to the four DynamoDB tables                           |
+| `data.py`        | Env-driven access to the DynamoDB tables                                |
 | `whatsapp.py`    | Self-contained WhatsApp send/extract helpers (End User Messaging Social) |
 | `logging_setup.py`| Shared log config (format: time/level/file/func/line) + `@log_io` input/output debug decorator |
 | `test_page.html` | Vanilla-JS local test UI (opened from `file://`)                        |
@@ -84,17 +74,23 @@ for the browser test flow to reach `/ask` and `/callback`.
 | -------------- | ------------------------------------------------------------------- | ------------------- |
 | `GET /`        | —                                                                   | the test page HTML  |
 | `POST /ask`    | `{ "conversation_id": str, "message": str }`                        | `{ "reply", "conversation_id" }` |
-| `POST /callback` | `{ "conversation_id": str, "receipt_id": str, "total_cost": any }` | `{ "status": "ok", "channel" }` |
+| `POST /callback` | `{ "conversation_id": str, "customer_found": bool, "Doc_dates": [str], "Sales_docs": [str], "Net_Prices": [str], "Currencies": [str], "Cust_Name": [str] }` | `{ "status": "ok", "channel" }` |
 | `GET /history?conversation_id=…` | query param `conversation_id`                     | `{ "conversation_id", "turns": [{role, text, created_at}] }` |
 
 **Callback matching.** The mapping table is keyed on `conversation_id`, and the
-callback is matched on that alone — it sends only `conversation_id`,
-`receipt_id`, and `total_cost`. The hook loads the mapping, reads the stored
-`workflow_id` (recorded by `create_order` from the RPA response `id`), and puts
-it in the completion message: *"Here are the results for workflow &lt;id&gt;:
-Receipt …, Total cost …"*. A missing mapping returns **404**.
+callback is matched on that alone — it does **not** receive the `workflow_id`.
+The hook loads the mapping, reads the stored `workflow_id` (recorded by
+`list_orders` from the RPA response `id`), and puts it in the completion
+message. Only `conversation_id` is required; every per-order field is optional
+and may be a parallel list **or** a single scalar (missing fields do **not**
+422). The five per-order lists (`Sales_docs`, `Net_Prices`, `Currencies`,
+`Cust_Name`, `Doc_dates`) are zipped by index into one line per order:
+*"Here are the orders for workflow &lt;id&gt;:\n1) Sales doc … | … &lt;currency&gt;
+| customer … | date …"*. When `customer_found` is false (or every list is
+empty) the message is *"No orders found for the requested customer (workflow
+&lt;id&gt;)."*. A missing mapping returns **404**.
 
-**Channel routing.** `create_order` records a `channel` in the mapping —
+**Channel routing.** `list_orders` records a `channel` in the mapping —
 `"whatsapp"` when the conversation arrived over SQS/WhatsApp (a sender number is
 present), or `"api"` for the HTTP `/ask` (UI) path. On completion the callback
 routes by that channel: `whatsapp` pushes the message to the user's WhatsApp
@@ -144,7 +140,7 @@ The **`from` field (here `201001234567`) is the conversation_id**:
                 "from": "201001234567",
                 "id": "wamid.TESTMESSAGE0001",
                 "type": "text",
-                "text": { "body": "hi, my id is U1001" }
+                "text": { "body": "hi, my customer id is C1001" }
               }
             ]
           }
@@ -171,7 +167,7 @@ What the Lambda actually receives — useful for a direct Lambda test too. The
     {
       "messageId": "11111111-1111-1111-1111-111111111111",
       "eventSource": "aws:sqs",
-      "body": "{\"Type\":\"Notification\",\"Message\":\"{\\\"whatsAppWebhookEntry\\\":[{\\\"changes\\\":[{\\\"value\\\":{\\\"messaging_product\\\":\\\"whatsapp\\\",\\\"messages\\\":[{\\\"from\\\":\\\"201001234567\\\",\\\"id\\\":\\\"wamid.TESTMESSAGE0001\\\",\\\"type\\\":\\\"text\\\",\\\"text\\\":{\\\"body\\\":\\\"hi, my id is U1001\\\"}}]}}]}]}\"}"
+      "body": "{\"Type\":\"Notification\",\"Message\":\"{\\\"whatsAppWebhookEntry\\\":[{\\\"changes\\\":[{\\\"value\\\":{\\\"messaging_product\\\":\\\"whatsapp\\\",\\\"messages\\\":[{\\\"from\\\":\\\"201001234567\\\",\\\"id\\\":\\\"wamid.TESTMESSAGE0001\\\",\\\"type\\\":\\\"text\\\",\\\"text\\\":{\\\"body\\\":\\\"hi, my customer id is C1001\\\"}}]}}]}]}\"}"
     }
   ]
 }
@@ -263,7 +259,6 @@ Those are **dev-only** and must never be packaged into the layer or the zip.
 | Variable                   | Required | Purpose                                                            |
 | -------------------------- | -------- | ------------------------------------------------------------------ |
 | `BEDROCK_MODEL_ID`         | yes      | Bedrock model / inference-profile id for `ChatBedrockConverse`     |
-| `USERS_TABLE_NAME`         | yes      | Authorized-users table                                             |
 | `CHAT_HISTORY_TABLE_NAME`  | yes      | Conversation-turns table                                           |
 | `CHECKPOINTER_TABLE_NAME`  | yes      | LangGraph checkpointer table (needs TTL — see below)               |
 | `MAPPING_TABLE_NAME`       | yes      | conversation → workflow mapping table                              |
@@ -302,7 +297,7 @@ key function logs its **input** and **output** data:
   and the composed response.
 - Core functions carry a `@log_io` decorator that logs call arguments and the
   return value, attributed to the real file/function/line (e.g.
-  `[agent.py:place_order:210] -> input: ...`).
+  `[agent.py:list_orders_request:210] -> input: ...`).
 - Long payloads are truncated so logs stay readable.
 
 Example (`LOG_LEVEL=DEBUG`):
@@ -315,16 +310,20 @@ Example (`LOG_LEVEL=DEBUG`):
 
 ## DynamoDB tables
 
-Four tables back the agent. Names come from the env vars above; keys and
+Three tables back the agent. Names come from the env vars above; keys and
 attributes are below. All tables work fine with **on-demand (PAY_PER_REQUEST)**
-capacity. Only the **users** table needs manual data (see *Seeding dummy data*);
-the agent writes the other three at runtime.
+capacity. The agent writes all three at runtime — none needs manual seeding.
+
+> **Users table removed.** Earlier versions of this app kept an authorized-users
+> table and a `verify_user` step. The customer id is now taken from the user
+> without any lookup, so the users table is **deleted/unused** and
+> `USERS_TABLE_NAME` is no longer read in the request path. (The `get_user` /
+> `is_authorized_user` helpers remain in `data.py` but are dormant.)
 
 ### Key schemas (create these in the console)
 
 | Table (env var)           | Partition key (HASH)    | Sort key (RANGE) | TTL              |
 | ------------------------- | ----------------------- | ---------------- | ---------------- |
-| `USERS_TABLE_NAME`        | `user_id` (S)           | —                | —                |
 | `CHAT_HISTORY_TABLE_NAME` | `conversation_id` (S)   | `sk` (S)         | —                |
 | `CHECKPOINTER_TABLE_NAME` | `pk` (S)                | `sk` (S)         | **`expires_at`** |
 | `MAPPING_TABLE_NAME`      | `conversation_id` (S)   | —                | —                |
@@ -333,29 +332,7 @@ Enable **TTL on the `expires_at` attribute** of the checkpointer table so
 LangGraph checkpoints expire automatically (items are written with
 `expires_at = now + 7 days`).
 
-### 1. Users table (`USERS_TABLE_NAME`)
-
-Authorization + optional stored profile. Only `user_id` (the key) is required;
-the profile fields are optional — a filled one is confirmed with the user, a
-missing one is asked for.
-
-| Attribute      | Type | Required | Notes                                      |
-| -------------- | ---- | -------- | ------------------------------------------ |
-| `user_id`      | S    | yes      | partition key; the ID the user types       |
-| `user_name`    | S    | no       | prefilled ship-to name                     |
-| `user_email`   | S    | no       | prefilled ship-to email                    |
-| `user_address` | S    | no       | prefilled ship-to address                  |
-
-```json
-{
-  "user_id": "U1001",
-  "user_name": "Ada Lovelace",
-  "user_email": "ada@example.com",
-  "user_address": "1 Analytical Engine Way"
-}
-```
-
-### 2. Chat history table (`CHAT_HISTORY_TABLE_NAME`)
+### 1. Chat history table (`CHAT_HISTORY_TABLE_NAME`)
 
 Written by the app (`data.append_turn`) on every user and assistant turn. You
 do not seed this.
@@ -373,12 +350,12 @@ do not seed this.
   "conversation_id": "conv-ab12cd34",
   "sk": "1760000000123-000042-a1b2c3d4",
   "role": "assistant",
-  "text": "Your order is complete. Receipt RCPT-9. Total cost 42.50.",
+  "text": "Here are the orders for workflow 237436573:\n1) Sales doc 4500001 | 100.00 USD | customer Acme | date 2026-01-01",
   "created_at": 1760000000
 }
 ```
 
-### 3. Checkpointer table (`CHECKPOINTER_TABLE_NAME`)
+### 2. Checkpointer table (`CHECKPOINTER_TABLE_NAME`)
 
 Managed entirely by `DynamoDBSaver` (LangGraph state). You create the table
 (keys + TTL) but never write items by hand.
@@ -390,24 +367,24 @@ Managed entirely by `DynamoDBSaver` (LangGraph state). You create the table
 | `expires_at`           | N    | **TTL attribute** — now + 7 days                   |
 | `checkpoint`, `metadata`, `type`, `channel`, `task_id`, … | — | serialized state written by the saver |
 
-### 4. Mapping table (`MAPPING_TABLE_NAME`)
+### 3. Mapping table (`MAPPING_TABLE_NAME`)
 
-Written by `create_order` (`data.put_mapping`) and read by `POST /callback`. You
+Written by `list_orders` (`data.put_mapping`) and read by `POST /callback`. You
 do not seed this.
 
 | Attribute         | Type | Notes                                              |
 | ----------------- | ---- | -------------------------------------------------- |
 | `conversation_id` | S    | partition key                                      |
-| `workflow_id`     | S    | the RPA response `id`, stored as a string; the callback must echo it |
-| `user_id`         | S    | the verified user                                  |
+| `workflow_id`     | S    | the RPA response `id`, stored as a string; echoed in the callback message |
+| `customer_id`     | S    | the customer id the user provided (unverified)     |
 | `whatsapp_number` | S    | WhatsApp recipient (empty for the API/UI channel)  |
-| `channel`         | S    | `"whatsapp"` or `"api"` — how the order was placed; the callback routes the completion the same way |
+| `channel`         | S    | `"whatsapp"` or `"api"` — how the lookup was started; the callback routes the completion the same way |
 
 ```json
 {
   "conversation_id": "conv-ab12cd34",
   "workflow_id": "237436573",
-  "user_id": "U1001",
+  "customer_id": "C1001",
   "whatsapp_number": "+201001234567",
   "channel": "whatsapp"
 }
@@ -415,75 +392,10 @@ do not seed this.
 
 ## Seeding dummy data
 
-Only the **users** table needs seeding — it is the authorization source. The
-chat-history, checkpointer, and mapping tables are populated automatically by
-the app at runtime, so leave them empty.
-
-### Option A — AWS Console
-
-1. Open the users table → **Explore table items** → **Create item**.
-2. Switch to **JSON** view and paste an item (add/remove profile fields as you
-   like — only `user_id` is required):
-
-   ```json
-   {
-     "user_id": "U1001",
-     "user_name": "Ada Lovelace",
-     "user_email": "ada@example.com",
-     "user_address": "1 Analytical Engine Way"
-   }
-   ```
-3. **Create item**. Repeat for each test user. The ID the user types in chat
-   must match `user_id` **exactly** (it is case-sensitive, trimmed only).
-
-### Option B — AWS CLI (`put-item`)
-
-Replace `<users-table>` with your actual table name:
-
-```bash
-aws dynamodb put-item --table-name <users-table> --item '{
-  "user_id":      {"S": "U1001"},
-  "user_name":    {"S": "Ada Lovelace"},
-  "user_email":   {"S": "ada@example.com"},
-  "user_address": {"S": "1 Analytical Engine Way"}
-}'
-
-# A user with no stored profile (the agent will ask for name/email/address):
-aws dynamodb put-item --table-name <users-table> --item '{
-  "user_id": {"S": "U1002"}
-}'
-```
-
-### Option C — AWS CLI (`batch-write-item`)
-
-Create `users-seed.json`:
-
-```json
-{
-  "<users-table>": [
-    { "PutRequest": { "Item": {
-      "user_id":      {"S": "U1001"},
-      "user_name":    {"S": "Ada Lovelace"},
-      "user_email":   {"S": "ada@example.com"},
-      "user_address": {"S": "1 Analytical Engine Way"}
-    }}},
-    { "PutRequest": { "Item": {
-      "user_id":      {"S": "U1002"},
-      "user_name":    {"S": "Alan Turing"},
-      "user_email":   {"S": "alan@example.com"}
-    }}}
-  ]
-}
-```
-
-Then:
-
-```bash
-aws dynamodb batch-write-item --request-items file://users-seed.json
-```
-
-> Note: `U1002` above omits `user_address`, so the agent will ask for the
-> address during ordering while prefilling the name and email.
+Nothing needs seeding. The customer id is taken from the user without any
+lookup, so there is no users table to populate. The chat-history, checkpointer,
+and mapping tables are all written automatically by the app at runtime — leave
+them empty.
 
 ## Local testing
 

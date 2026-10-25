@@ -1,32 +1,29 @@
 """LangGraph agent core: state, tools, LLM, HITL interrupt, and run_agent.
 
-The graph implements the ordering flow both triggers share:
+The graph implements the order-lookup flow both triggers share:
 
-1. Welcome + ask for the user ID. The LLM extracts the ID from whatever the
-   user types (e.g. "my id is U1001") and calls the ``verify_user`` tool. The
-   tool returns ``True`` when the id exists in the users table, which flips the
-   conversation to authorized; otherwise it returns ``False`` and the assistant
-   asks again. Until authorized, every OTHER tool call is blocked.
-2. Once authorized, collect the order parameters (user_name, user_email,
-   user_address, products, number_of_products).
-3. Before the ``create_order`` tool runs, pause with ``interrupt(...)`` so the
-   user can confirm the collected parameters. Only an explicit affirmative
-   resume value lets the order proceed; anything else cancels.
-4. ``create_order`` POSTs to the RPA order endpoint (including the
-   conversation_id in the body), parses the workflow_id, and records the
-   conversation->workflow mapping via ``data.put_mapping``.
+1. Welcome + ask the user for their customer id. The id is NOT verified against
+   any table — the user simply provides it and the LLM calls the
+   ``list_orders`` tool with it.
+2. Before the ``list_orders`` tool runs, pause with ``interrupt(...)`` so the
+   user can confirm they want to list the orders for that customer id. Only an
+   explicit affirmative resume value lets the lookup proceed; anything else
+   cancels, and an ambiguous reply re-asks.
+3. ``list_orders`` POSTs to the RPA/SAP order endpoint (body contains exactly
+   ``conversation_id`` and ``customer_id``), parses the workflow id from the
+   response ``id`` field, and records the conversation->workflow mapping via
+   ``data.put_mapping``.
 
-Authorization is enforced in ``tools_node``: before the user is verified only
-``verify_user`` may run; any other tool is refused with a message telling the
-model to authorize first. ``user_id`` and ``whatsapp_number`` are taken from
-graph state (never from LLM-supplied tool arguments) when the order is placed.
-Every setting comes from the environment; nothing is hardcoded.
+There is no authorization step: all tools may run without verification. The
+``conversation_id`` and ``whatsapp_number`` are taken from graph state (never
+from LLM-supplied tool arguments) when the lookup is started. Every setting
+comes from the environment; nothing is hardcoded.
 """
 
 import datetime
 import json
 import os
-from typing import Annotated, Optional, TypedDict
+from typing import Annotated, TypedDict
 
 import requests
 from langchain_aws import ChatBedrockConverse
@@ -46,35 +43,18 @@ DEFAULT_MODEL_ID = "us.anthropic.claude-3-5-sonnet-20241022-v2:0"
 ORDER_API_TIMEOUT = 30
 
 SYSTEM_PROMPT = (
-    "You are a friendly ordering assistant. Start every new conversation with a "
-    "short welcome and ask the user for their user ID so you can authorize them. "
-    "The user may give the ID conversationally (for example 'my id is U1001' or "
-    "'ah, it's U1001') - extract just the ID token from their message and call "
-    "the verify_user tool with it. Do NOT ask the user to retype a bare ID; you "
-    "do the extracting. If verify_user returns authorized=false, apologise and "
-    "ask them to double-check and send the ID again, then call verify_user with "
-    "the new value. Do not collect any order details or call any other tool "
-    "until verify_user has returned authorized=true.\n"
+    "You are a friendly orders assistant. Start every new conversation with a "
+    "short welcome and ask the user for their customer id so you can look up "
+    "their orders. The user may give the id conversationally (for example 'my "
+    "customer id is C1001' or 'it's C1001') - extract just the id token from "
+    "their message. Do NOT verify the id against anything; simply take what the "
+    "user gives you.\n"
     "\n"
-    "When verify_user returns authorized=true it also returns the user's stored "
-    "profile (name, email, address). Each of these may be filled or empty:\n"
-    "- For every profile field that is FILLED, do NOT ask for it from scratch. "
-    "Instead show the stored value and ask the user to confirm it or change it, "
-    "e.g. 'I'll ship to the name/email/address I have on file: <name>, <email>, "
-    "<address>. Use these, or would you like to change any of them?'\n"
-    "- For every profile field that is EMPTY (not on file), you MUST ask the "
-    "user to provide it.\n"
-    "Then collect the order itself: products and number_of_products.\n"
+    "Once you have the customer id, call the list_orders tool with it. A "
+    "confirmation step will then ask the user to answer yes or no before the "
+    "lookup actually runs.\n"
     "\n"
-    "The final create_order arguments are: user_name, user_email, user_address "
-    "(each either the confirmed stored value or the new value the user gave), "
-    "plus products and number_of_products. When you have all five and the user "
-    "has confirmed the ship-to details, call the create_order tool. A "
-    "confirmation step will then show the full order and ask the user to answer "
-    "yes or no before the order is actually placed.\n"
-    "\n"
-    "Use the get_current_time tool only if the user asks about the current time. "
-    "Never ask the user for their user ID again once they are authorized."
+    "Use the get_current_time tool only if the user asks about the current time."
 )
 
 
@@ -85,54 +65,14 @@ class AgentState(TypedDict):
     """Mutable state threaded through the graph for one conversation."""
 
     messages: Annotated[list, add_messages]
-    authorized: bool
-    user_id: Optional[str]
     conversation_id: str
     whatsapp_number: str
-    # Profile prefilled from the users table at verification time. Empty string
-    # means "not stored" -> the agent must ask the user for that field.
-    profile_name: str
-    profile_email: str
-    profile_address: str
     # Set when a confirm reply was neither yes nor no, so the graph loops back
     # into the confirm node to re-ask for a clean yes/no.
     reconfirm: bool
 
 
 # --- Tools -----------------------------------------------------------------
-
-
-@tool
-def verify_user(user_id: str) -> dict:
-    """Authorize a user by their ID and return their stored profile.
-
-    The model should extract the ID token from the user's message (which may be
-    conversational, e.g. "my id is U1001") and pass just that token. Returns a
-    dict ``{"authorized": bool, "profile": {...}}``. When authorized, ``profile``
-    carries the stored ``user_name``/``user_email``/``user_address`` (any of
-    which may be empty if not on file) so the assistant can confirm the filled
-    ones with the user and only ask for the missing ones. No other tool may run
-    until this returns ``authorized=true``.
-    """
-    return _verify_user_lookup((user_id or "").strip())
-
-
-@log_io()
-def _verify_user_lookup(candidate):
-    """Shared lookup used by the tool and by tools_node (for state updates)."""
-    if not candidate:
-        return {"authorized": False, "profile": {}}
-    item = data.get_user(candidate)
-    if not item:
-        return {"authorized": False, "profile": {}}
-    return {
-        "authorized": True,
-        "profile": {
-            "user_name": item.get("user_name", "") or "",
-            "user_email": item.get("user_email", "") or "",
-            "user_address": item.get("user_address", "") or "",
-        },
-    }
 
 
 @tool
@@ -145,65 +85,45 @@ def get_current_time() -> str:
 
 
 @tool
-def create_order(
-    user_name: str,
-    user_email: str,
-    user_address: str,
-    products: str,
-    number_of_products: int,
-    conversation_id: str,
-) -> dict:
-    """Start an order workflow via the RPA order endpoint.
+def list_orders(customer_id: str, conversation_id: str) -> dict:
+    """List the orders for a customer id via the RPA/SAP order endpoint.
 
-    POSTs the order details (including ``conversation_id``) to the configured
-    order API, reads the workflow id from the response ``id`` field, and records
-    the conversation->workflow mapping. ``user_id`` and ``whatsapp_number`` are
-    injected from graph state, not from the model's arguments.
+    The ``customer_id`` is whatever the user provided (never verified). POSTs to
+    the configured order API, reads the workflow id from the response ``id``
+    field, and records the conversation->workflow mapping. ``conversation_id``
+    is injected from graph state, not from the model's arguments.
     """
-    return place_order(
-        user_name=user_name,
-        user_email=user_email,
-        user_address=user_address,
-        products=products,
-        number_of_products=number_of_products,
+    return list_orders_request(
+        customer_id=customer_id,
         conversation_id=conversation_id,
-        user_id=None,
         whatsapp_number="",
         channel="api",
     )
 
 
 @log_io()
-def place_order(
+def list_orders_request(
     *,
-    user_name,
-    user_email,
-    user_address,
-    products,
-    number_of_products,
+    customer_id,
     conversation_id,
-    user_id,
     whatsapp_number,
     channel,
 ):
-    """Perform the order POST + mapping write using state-sourced identity.
+    """Perform the order-lookup POST + mapping write using state-sourced ids.
 
-    Separated from the ``create_order`` tool so the executing node can supply
-    ``user_id``/``whatsapp_number``/``channel`` from graph state rather than
-    trusting the model. ``channel`` is ``"whatsapp"`` or ``"api"`` and is stored
-    in the mapping so the callback can route the completion the same way. The
-    workflow id is taken from the RPA response ``id`` field (a numeric id,
+    Separated from the ``list_orders`` tool so the executing node can supply
+    ``conversation_id``/``whatsapp_number``/``channel`` from graph state rather
+    than trusting the model. The POST body contains exactly ``conversation_id``
+    and ``customer_id``. ``channel`` is ``"whatsapp"`` or ``"api"`` and is
+    stored in the mapping so the callback can route the completion the same way.
+    The workflow id is taken from the RPA response ``id`` field (a numeric id,
     coerced to a string). Returns a dict with ``workflow_id`` and a user-facing
     confirmation.
     """
     endpoint = os.environ["ORDER_API_ENDPOINT"]
     body = {
-        "user_name": user_name,
-        "user_email": user_email,
-        "user_address": user_address,
-        "products": products,
-        "number_of_products": number_of_products,
         "conversation_id": conversation_id,
+        "customer_id": customer_id,
     }
     headers = {"Content-Type": "application/json"}
     # Always attach a bearer Authorization header when an API key is configured.
@@ -235,18 +155,18 @@ def place_order(
     # Store/compare the workflow id as a string (DynamoDB key + callback match).
     workflow_id = str(raw_id) if raw_id is not None else None
 
-    data.put_mapping(conversation_id, workflow_id, user_id, whatsapp_number, channel)
+    data.put_mapping(conversation_id, workflow_id, customer_id, whatsapp_number, channel)
 
     return {
         "workflow_id": workflow_id,
         "message": (
-            f"Your order has been started. Your workflow ID is {workflow_id}. "
-            "You'll receive an update here once it finishes."
+            f"I've started the lookup for customer {customer_id}. Your workflow "
+            f"ID is {workflow_id}. I'll share the orders here once they arrive."
         ),
     }
 
 
-TOOLS = [verify_user, get_current_time, create_order]
+TOOLS = [get_current_time, list_orders]
 TOOLS_BY_NAME = {t.name: t for t in TOOLS}
 
 
@@ -272,33 +192,26 @@ def agent_node(state: AgentState) -> dict:
 
 
 def _format_order_summary(params):
-    """Build the human-readable order summary shown at the confirm step."""
-    lines = [
-        "Here is your order:",
-        "",
-        f"- Name: {params.get('user_name', '')}",
-        f"- Email: {params.get('user_email', '')}",
-        f"- Address: {params.get('user_address', '')}",
-        f"- Products: {params.get('products', '')}",
-        f"- Number of products: {params.get('number_of_products', '')}",
-        "",
-        "Please confirm you want to place this order. (enter: yes or no)",
-    ]
-    return "\n".join(lines)
+    """Build the human-readable confirm prompt shown at the confirm step."""
+    customer_id = params.get("customer_id", "")
+    return (
+        "Do you want to list the orders for that customer id? "
+        f"(customer id: {customer_id}) (enter: yes or no)"
+    )
 
 
 @log_io()
 def confirm_node(state: AgentState) -> dict:
-    """Pause before create_order so the user can confirm the parameters.
+    """Pause before list_orders so the user can confirm the lookup.
 
-    Shows the full order summary and asks the user to answer **yes or no**.
+    Shows the customer id and asks the user to answer **yes or no**.
     ``interrupt`` pauses until the user replies:
-      * an affirmative (yes/ok/confirm/...) proceeds to place the order,
+      * an affirmative (yes/ok/confirm/...) proceeds to the lookup,
       * a clear negative (no/cancel/stop/...) cancels,
       * anything ambiguous re-prompts (loops the interrupt) instead of
-        silently cancelling, so a stray reply never drops the order.
+        silently cancelling, so a stray reply never drops the lookup.
     """
-    tool_call = _pending_create_order_call(state["messages"])
+    tool_call = _pending_list_orders_call(state["messages"])
     params = dict(tool_call["args"]) if tool_call else {}
     summary = _format_order_summary(params)
 
@@ -308,15 +221,15 @@ def confirm_node(state: AgentState) -> dict:
     # (instead of silently cancelling or placing the order).
     if state.get("reconfirm"):
         prompt = (
-            "Sorry, I didn't catch that - please answer 'yes' to place the "
-            "order or 'no' to cancel.\n\n" + summary
+            "Sorry, I didn't catch that - please answer 'yes' to list the "
+            "orders or 'no' to cancel.\n\n" + summary
         )
     else:
         prompt = summary
 
     decision = interrupt(
         {
-            "type": "confirm_order",
+            "type": "confirm_list_orders",
             "message": prompt,
             "parameters": params,
         }
@@ -330,13 +243,13 @@ def confirm_node(state: AgentState) -> dict:
             "reconfirm": False,
             "messages": [
                 ToolMessage(
-                    content="Order cancelled by the user.",
+                    content="Order lookup cancelled by the user.",
                     tool_call_id=tool_call["id"] if tool_call else "cancelled",
                 ),
                 AIMessage(
                     content=(
-                        "No problem, I've cancelled that order. Let me know if "
-                        "you'd like to change anything or try again."
+                        "No problem, I've cancelled that lookup. Let me know if "
+                        "you'd like to try again with a different customer id."
                     )
                 ),
             ],
@@ -350,57 +263,28 @@ def confirm_node(state: AgentState) -> dict:
 def tools_node(state: AgentState) -> dict:
     """Execute the tools requested by the last AI message.
 
-    Authorization gate: until the conversation is authorized, the only tool
-    allowed to run is ``verify_user``. Any other tool call is refused with a
-    ToolMessage telling the model to authorize first. ``verify_user`` returning
-    ``True`` flips ``authorized`` and records the verified ``user_id`` in state.
-
-    For ``create_order`` the identity fields (user_id, whatsapp_number) and the
-    conversation_id come from graph state, not the model's tool arguments.
+    No authorization step: every tool may run. For ``list_orders`` the
+    ``conversation_id``/``whatsapp_number`` come from graph state, not the
+    model's tool arguments, and ``channel`` is derived from whether a WhatsApp
+    sender number is present.
     """
     last = state["messages"][-1]
     tool_calls = getattr(last, "tool_calls", None) or []
     outputs = []
-    authorized = bool(state.get("authorized"))
-    new_user_id = None
-    new_profile = None
 
     for call in tool_calls:
         name = call["name"]
         args = dict(call.get("args", {}))
 
-        if name == "verify_user":
-            candidate = (args.get("user_id") or "").strip()
-            result = _verify_user_lookup(candidate)
-            if result["authorized"]:
-                authorized = True
-                new_user_id = candidate
-                new_profile = result["profile"]
-
-        elif not authorized:
-            # Gate every non-verify tool until the user is authorized.
-            result = {
-                "error": "not_authorized",
-                "message": (
-                    "The user is not authorized yet. Ask for their user ID and "
-                    "call verify_user first."
-                ),
-            }
-
-        elif name == "create_order":
+        if name == "list_orders":
             wa_number = state.get("whatsapp_number", "") or ""
             # Channel is derived from how the conversation reached us: a WhatsApp
             # sender number means the SQS/WhatsApp path; its absence means the
             # HTTP /ask (UI) path.
             channel = "whatsapp" if wa_number else "api"
-            result = place_order(
-                user_name=args.get("user_name"),
-                user_email=args.get("user_email"),
-                user_address=args.get("user_address"),
-                products=args.get("products"),
-                number_of_products=args.get("number_of_products"),
+            result = list_orders_request(
+                customer_id=args.get("customer_id"),
                 conversation_id=state["conversation_id"],
-                user_id=state.get("user_id") or new_user_id,
                 whatsapp_number=wa_number,
                 channel=channel,
             )
@@ -411,26 +295,17 @@ def tools_node(state: AgentState) -> dict:
         content = result if isinstance(result, str) else json.dumps(result)
         outputs.append(ToolMessage(content=content, tool_call_id=call["id"]))
 
-    update = {"messages": outputs}
-    if authorized and not state.get("authorized"):
-        update["authorized"] = True
-    if new_user_id:
-        update["user_id"] = new_user_id
-    if new_profile is not None:
-        update["profile_name"] = new_profile["user_name"]
-        update["profile_email"] = new_profile["user_email"]
-        update["profile_address"] = new_profile["user_address"]
-    return update
+    return {"messages": outputs}
 
 
 # --- Routing helpers -------------------------------------------------------
 
 
-def _pending_create_order_call(messages):
-    """Return the most recent create_order tool call in the message history."""
+def _pending_list_orders_call(messages):
+    """Return the most recent list_orders tool call in the message history."""
     for message in reversed(messages or []):
         for call in getattr(message, "tool_calls", None) or []:
-            if call["name"] == "create_order":
+            if call["name"] == "list_orders":
                 return call
     return None
 
@@ -477,7 +352,7 @@ def route_after_agent(state: AgentState) -> str:
     tool_calls = getattr(last, "tool_calls", None) or []
     if not tool_calls:
         return END
-    if any(call["name"] == "create_order" for call in tool_calls):
+    if any(call["name"] == "list_orders" for call in tool_calls):
         return "confirm"
     return "tools"
 
@@ -487,7 +362,7 @@ def route_after_confirm(state: AgentState) -> str:
 
     * reconfirm set -> back into confirm to re-ask (ambiguous reply).
     * cancelled (confirm appended an AIMessage, no pending tool call) -> END.
-    * confirmed -> tools, to actually place the order.
+    * confirmed -> tools, to actually run the lookup.
     """
     if state.get("reconfirm"):
         return "confirm"
@@ -569,10 +444,9 @@ def run_agent(conversation_id, user_text, whatsapp_number=""):
 
     If the thread is paused on an interrupt, ``user_text`` resumes it via
     ``Command(resume=...)``. For a brand-new thread the full initial state is
-    seeded (authorized=False). For an existing, non-paused thread only the new
-    human message (and a refreshed whatsapp_number) is appended — the
-    ``authorized``/``user_id`` channels are preserved so authorization persists
-    across turns and is never reset by a follow-up message.
+    seeded. For an existing, non-paused thread only the new human message (and a
+    refreshed whatsapp_number) is appended so ``conversation_id`` is never reset
+    by a follow-up message.
     """
     config = {"configurable": {"thread_id": conversation_id}}
 
@@ -588,15 +462,10 @@ def run_agent(conversation_id, user_text, whatsapp_number=""):
             "messages": [HumanMessage(content=user_text)],
             "conversation_id": conversation_id,
             "whatsapp_number": whatsapp_number,
-            "authorized": False,
-            "user_id": None,
-            "profile_name": "",
-            "profile_email": "",
-            "profile_address": "",
             "reconfirm": False,
         }
     else:
-        # Append only; do NOT overwrite authorized/user_id/conversation_id.
+        # Append only; do NOT overwrite conversation_id.
         payload = {"messages": [HumanMessage(content=user_text)]}
         if whatsapp_number:
             payload["whatsapp_number"] = whatsapp_number

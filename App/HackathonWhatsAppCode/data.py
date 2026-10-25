@@ -141,16 +141,16 @@ def get_history(conversation_id):
 # --- Conversation -> workflow mapping --------------------------------------
 
 @log_io()
-def put_mapping(conversation_id, workflow_id, user_id, whatsapp_number, channel):
+def put_mapping(conversation_id, workflow_id, customer_id, whatsapp_number, channel):
     """Store the conversation->workflow mapping (PK ``conversation_id``).
 
-    ``channel`` records how the order was placed (``"whatsapp"`` or ``"api"``)
+    ``channel`` records how the lookup was started (``"whatsapp"`` or ``"api"``)
     so the callback can route the completion message back the same way.
     """
     item = {
         "conversation_id": conversation_id,
         "workflow_id": workflow_id,
-        "user_id": user_id,
+        "customer_id": customer_id,
         "whatsapp_number": whatsapp_number,
         "channel": channel,
     }

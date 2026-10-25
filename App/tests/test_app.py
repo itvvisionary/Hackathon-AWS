@@ -87,10 +87,10 @@ def test_ask_returns_reply_and_appends_two_turns(mocked, client):
 # --- POST /callback --------------------------------------------------------
 
 
-def test_callback_api_channel_stores_without_whatsapp(mocked, client, monkeypatch):
+def test_callback_api_channel_composes_order_list(mocked, client, monkeypatch):
     # API channel: even if WhatsApp were configured, nothing is sent; the
-    # message is only stored to history for the UI to load. The workflow_id in
-    # the message comes from the stored mapping, not the request.
+    # composed order-list message is only stored to history for the UI to load.
+    # The workflow_id in the message comes from the stored mapping.
     monkeypatch.setenv("WHATSAPP_PHONE_NUMBER_ID", "pn-123")
     mocked.get_mapping.return_value = {
         "conversation_id": "conv-2",
@@ -101,8 +101,12 @@ def test_callback_api_channel_stores_without_whatsapp(mocked, client, monkeypatc
         "/callback",
         json={
             "conversation_id": "conv-2",
-            "receipt_id": "RCPT-9",
-            "total_cost": "42.50",
+            "customer_found": True,
+            "Sales_docs": ["4500001", "4500002"],
+            "Net_Prices": ["100.00", "250.50"],
+            "Currencies": ["USD", "USD"],
+            "Cust_Name": ["Acme", "Acme"],
+            "Doc_dates": ["2026-01-01", "2026-02-01"],
         },
     )
     assert res.status_code == 200
@@ -110,8 +114,9 @@ def test_callback_api_channel_stores_without_whatsapp(mocked, client, monkeypatc
 
     mocked.get_mapping.assert_called_once_with("conv-2")
     expected = (
-        "Here are the results for workflow 237436573: "
-        "Receipt RCPT-9. Total cost 42.50."
+        "Here are the orders for workflow 237436573:\n"
+        "1) Sales doc 4500001 | 100.00 USD | customer Acme | date 2026-01-01\n"
+        "2) Sales doc 4500002 | 250.50 USD | customer Acme | date 2026-02-01"
     )
     mocked.append_turn.assert_called_once_with("conv-2", "assistant", expected)
     # API channel -> never send WhatsApp even though it's configured.
@@ -124,8 +129,8 @@ def test_callback_rejects_unknown_conversation(mocked, client):
         "/callback",
         json={
             "conversation_id": "nope",
-            "receipt_id": "RCPT",
-            "total_cost": 1,
+            "customer_found": True,
+            "Sales_docs": ["4500001"],
         },
     )
     assert res.status_code == 404
@@ -145,14 +150,18 @@ def test_callback_sends_whatsapp_when_configured(mocked, client, monkeypatch):
         "/callback",
         json={
             "conversation_id": "conv-3",
-            "receipt_id": "RCPT-3",
-            "total_cost": 10,
+            "customer_found": True,
+            "Sales_docs": ["4500003"],
+            "Net_Prices": ["10"],
+            "Currencies": ["EUR"],
+            "Cust_Name": ["Globex"],
+            "Doc_dates": ["2026-03-03"],
         },
     )
     assert res.status_code == 200
     expected = (
-        "Here are the results for workflow 237436573: "
-        "Receipt RCPT-3. Total cost 10."
+        "Here are the orders for workflow 237436573:\n"
+        "1) Sales doc 4500003 | 10 EUR | customer Globex | date 2026-03-03"
     )
     mocked.send_whatsapp_message.assert_called_once_with("+15551230000", expected)
     mocked.append_turn.assert_called_once_with("conv-3", "assistant", expected)
@@ -171,8 +180,8 @@ def test_callback_does_not_crash_when_whatsapp_send_fails(mocked, client, monkey
         "/callback",
         json={
             "conversation_id": "conv-4",
-            "receipt_id": "RCPT-4",
-            "total_cost": 1,
+            "customer_found": True,
+            "Sales_docs": ["4500004"],
         },
     )
     assert res.status_code == 200
@@ -181,19 +190,33 @@ def test_callback_does_not_crash_when_whatsapp_send_fails(mocked, client, monkey
     mocked.append_turn.assert_called_once()
 
 
-def test_callback_missing_field_returns_422_with_detail(mocked, client):
-    # Omit receipt_id -> validation fails before the route runs.
+def test_callback_customer_not_found_message(mocked, client):
+    mocked.get_mapping.return_value = {
+        "workflow_id": "237436573",
+        "channel": "api",
+    }
     res = client.post(
         "/callback",
-        json={"conversation_id": "c", "total_cost": 1},  # receipt_id omitted
+        json={"conversation_id": "conv-nf", "customer_found": False},
     )
-    assert res.status_code == 422
-    detail = res.json()["detail"]
-    # The field-level error names the missing field.
-    assert any("receipt_id" in str(e.get("loc", "")) for e in detail)
-    # The route never ran, so no mapping lookup / history write happened.
-    mocked.get_mapping.assert_not_called()
-    mocked.append_turn.assert_not_called()
+    assert res.status_code == 200
+    expected = "No orders found for the requested customer (workflow 237436573)."
+    mocked.append_turn.assert_called_once_with("conv-nf", "assistant", expected)
+    mocked.send_whatsapp_message.assert_not_called()
+
+
+def test_callback_missing_optional_fields_does_not_422(mocked, client):
+    # All per-order fields omitted -> must NOT 422 (lenient). With no data the
+    # "no orders" branch is composed and the route runs normally.
+    mocked.get_mapping.return_value = {
+        "workflow_id": "237436573",
+        "channel": "api",
+    }
+    res = client.post("/callback", json={"conversation_id": "c"})
+    assert res.status_code == 200
+    expected = "No orders found for the requested customer (workflow 237436573)."
+    mocked.get_mapping.assert_called_once_with("c")
+    mocked.append_turn.assert_called_once_with("c", "assistant", expected)
 
 
 def test_history_returns_turns(mocked, client):

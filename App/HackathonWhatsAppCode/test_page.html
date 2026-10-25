@@ -83,22 +83,28 @@
           <input id="base" placeholder="https://xxxxx.lambda-url.us-east-1.on.aws" />
           <label for="conv">conversation_id</label>
           <input id="conv" />
-          <p class="hint">Type your user ID first to get authorized, then share
-            the order details. When asked to confirm, reply <strong>yes</strong>.</p>
+          <p class="hint">Provide a customer id when the assistant asks. When
+            asked to confirm the lookup, reply <strong>yes</strong>.</p>
         </section>
 
         <section>
           <h2>Callback simulator (/callback)</h2>
-          <div class="row">
-            <div>
-              <label for="receipt">receipt_id</label>
-              <input id="receipt" placeholder="RCPT-123" />
-            </div>
-            <div>
-              <label for="total">total_cost</label>
-              <input id="total" placeholder="49.99" />
-            </div>
-          </div>
+          <label for="customerFound">
+            <input type="checkbox" id="customerFound" style="width:auto;margin-right:6px" checked />
+            customer_found
+          </label>
+          <label for="salesDocs">Sales_docs</label>
+          <input id="salesDocs" placeholder="4500001, 4500002" />
+          <label for="netPrices">Net_Prices</label>
+          <input id="netPrices" placeholder="100.00, 250.50" />
+          <label for="currencies">Currencies</label>
+          <input id="currencies" placeholder="USD, USD" />
+          <label for="custName">Cust_Name</label>
+          <input id="custName" placeholder="Acme, Acme" />
+          <label for="docDates">Doc_dates</label>
+          <input id="docDates" placeholder="2026-01-01, 2026-02-01" />
+          <p class="hint">Each field is comma-separated; the values are zipped by
+            index into one order per position.</p>
           <button id="callback">Send callback</button>
         </section>
       </div>
@@ -153,12 +159,18 @@
       }
     }
 
+    function splitList(id) {
+      return document.getElementById(id).value
+        .split(",")
+        .map(function (s) { return s.trim(); })
+        .filter(function (s) { return s.length > 0; });
+    }
+
     async function sendCallback() {
       var base = baseUrl();
       if (!base) { addBubble("system", "Set the Function URL base first."); return; }
       var conv = document.getElementById("conv").value;
-      var receipt = document.getElementById("receipt").value.trim();
-      var total = document.getElementById("total").value.trim();
+      var customerFound = document.getElementById("customerFound").checked;
 
       try {
         var res = await fetch(base + "/callback", {
@@ -166,8 +178,12 @@
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             conversation_id: conv,
-            receipt_id: receipt,
-            total_cost: total
+            customer_found: customerFound,
+            Doc_dates: splitList("docDates"),
+            Sales_docs: splitList("salesDocs"),
+            Net_Prices: splitList("netPrices"),
+            Currencies: splitList("currencies"),
+            Cust_Name: splitList("custName")
           })
         });
         var data = await res.json();

@@ -5,16 +5,14 @@ Everything external is mocked: the Bedrock LLM (via ``agent._build_llm``),
 The compiled graph is rebuilt per test with an in-memory checkpointer so the
 HITL interrupt/resume behaviour can be exercised without AWS.
 
-Authorization is now tool-driven: the LLM extracts the id from the user's
-message and calls the ``verify_user`` tool, which returns authorized true/false.
-Only after an authorized=true result may any other tool run. Scenarios:
-  1. unauthorized id -> verify_user returns false, order tools stay blocked
-  2. authorized id   -> verify_user returns true, agent proceeds to collect
-  3. all params collected -> interrupt fires, NO HTTP POST yet
-  4. resume 'yes'    -> requests.post IS called (body has conversation_id) and
-     put_mapping is called with (conversation_id, workflow_id, user_id, number)
-  5. resume 'no'     -> no POST
-  6. create_order before verification is refused (gate), no POST
+There is no authorization step: the user simply provides a customer id and the
+LLM calls the ``list_orders`` tool with it. Scenarios:
+  1. agent asks for the customer id, then emits list_orders -> the confirm
+     interrupt fires with the new prompt and NO HTTP POST happens yet.
+  2. resume 'yes' -> requests.post is called once with a body of exactly
+     {conversation_id, customer_id} and put_mapping records the row.
+  3. resume 'no' -> no POST, no mapping.
+  4. ambiguous reply -> re-asks, no POST.
 """
 
 from unittest.mock import MagicMock
@@ -26,14 +24,23 @@ from langgraph.checkpoint.memory import InMemorySaver
 import agent
 
 
-ORDER_ARGS = {
-    "user_name": "Ada Lovelace",
-    "user_email": "ada@example.com",
-    "user_address": "1 Analytical Engine Way",
-    "products": "Widgets",
-    "number_of_products": 3,
-    "conversation_id": "llm-supplied-will-be-ignored",
-}
+def _ai(text):
+    return AIMessage(content=text)
+
+
+def _ai_list_orders(customer_id, call_id="call-1"):
+    return AIMessage(
+        content="Looking up your orders now.",
+        tool_calls=[
+            {
+                "name": "list_orders",
+                # conversation_id here is intentionally bogus: the node must
+                # source it from graph state, never from the model's args.
+                "args": {"customer_id": customer_id, "conversation_id": "ignored"},
+                "id": call_id,
+            }
+        ],
+    )
 
 
 class FakeLLM:
@@ -41,11 +48,6 @@ class FakeLLM:
 
     ``invoke`` pops and returns the next scripted AIMessage. ``bind_tools`` is a
     no-op returning self so the production binding call is harmless.
-
-    The exact number of times the graph calls the LLM per ``run_agent`` turn
-    depends on tool loops (verify_user loops back to the agent), so tests script
-    the full ordered list of responses across the whole scenario; each invoke
-    consumes the next one.
     """
 
     def __init__(self, responses):
@@ -56,28 +58,8 @@ class FakeLLM:
 
     def invoke(self, _messages):
         if not self._responses:
-            # Nothing more scripted: return an inert assistant message so the
-            # graph ends this turn instead of raising IndexError.
             return AIMessage(content="(no further action)")
         return self._responses.pop(0)
-
-
-def _ai(text):
-    return AIMessage(content=text)
-
-
-def _ai_verify(user_id, call_id="verify-1"):
-    return AIMessage(
-        content="Let me check that ID.",
-        tool_calls=[{"name": "verify_user", "args": {"user_id": user_id}, "id": call_id}],
-    )
-
-
-def _ai_create_order(call_id="call-1"):
-    return AIMessage(
-        content="Placing your order now.",
-        tool_calls=[{"name": "create_order", "args": dict(ORDER_ARGS), "id": call_id}],
-    )
 
 
 @pytest.fixture
@@ -88,20 +70,12 @@ def order_env(monkeypatch):
 
 @pytest.fixture
 def mocked(monkeypatch, order_env):
-    """Mock data.*, requests.post, and compile an in-memory graph.
+    """Mock data.put_mapping, requests.post, and compile an in-memory graph.
 
-    Returns a harness exposing ``is_authorized``, ``put_mapping``, ``post`` and
-    a ``set_llm`` helper so each test scripts the LLM responses it needs.
+    Returns a harness exposing ``put_mapping``, ``post`` and a ``set_llm``
+    helper so each test scripts the LLM responses it needs.
     """
-
-    # verify_user now uses data.get_user (returns the item or None). Default:
-    # an authorized user with no stored profile (all fields empty). Tests can
-    # override via harness.set_user(...).
-    get_user = MagicMock(return_value={"user_id": "U1001"})
-    is_authorized = MagicMock(return_value=True)
     put_mapping = MagicMock()
-    monkeypatch.setattr(agent.data, "get_user", get_user)
-    monkeypatch.setattr(agent.data, "is_authorized_user", is_authorized)
     monkeypatch.setattr(agent.data, "put_mapping", put_mapping)
 
     response = MagicMock()
@@ -122,22 +96,13 @@ def mocked(monkeypatch, order_env):
         pass
 
     harness = Harness()
-    harness.get_user = get_user
-    harness.is_authorized = is_authorized
     harness.put_mapping = put_mapping
     harness.post = post
-
-    def set_user(item):
-        """Set the users-table item verify_user will see (None = unknown id)."""
-        get_user.return_value = item
-
-    harness.set_user = set_user
 
     def set_llm(*responses):
         # Build ONE FakeLLM and return it on every _build_llm() call so the
         # scripted responses advance across the multiple LLM invocations a
-        # single run_agent turn can make (the agent node re-runs after each
-        # tool loop). A fresh FakeLLM per call would always replay response #1.
+        # single run_agent turn can make.
         llm = FakeLLM(responses)
         monkeypatch.setattr(agent, "_build_llm", lambda: llm)
 
@@ -151,188 +116,134 @@ def _state(conversation_id):
     )
 
 
-# --- Scenario 1: unauthorized ---------------------------------------------
+# --- Scenario (a): interrupt fires before any POST -------------------------
 
 
-def test_unauthorized_id_does_not_authorize(mocked):
-    mocked.set_user(None)  # unknown id -> verify_user returns authorized=false
+def test_list_orders_interrupts_without_post(mocked):
     mocked.set_llm(
-        _ai_verify("U-bad"),
-        _ai("I couldn't verify that ID. Please double-check and send it again."),
+        _ai("Welcome! What's your customer id?"),  # turn 1: ask for the id
+        _ai_list_orders("C1001"),  # turn 2: emit the lookup
     )
 
-    reply = agent.run_agent("conv-1", "ah, my id is U-bad")
+    # Turn 1: agent asks for the customer id.
+    agent.run_agent("conv-1", "hi")
+    # Turn 2: user supplies the id; agent emits list_orders -> confirm interrupt.
+    reply = agent.run_agent("conv-1", "my customer id is C1001")
 
-    mocked.get_user.assert_called_once_with("U-bad")
-    assert _state("conv-1").values.get("authorized") is not True
-    assert reply
-    mocked.post.assert_not_called()
-    mocked.put_mapping.assert_not_called()
-
-
-# --- Scenario 2: authorized -> collect params ------------------------------
-
-
-def test_authorized_id_proceeds_to_collect_params(mocked):
-    # Authorized user WITH a stored profile -> prefilled into state.
-    mocked.set_user(
-        {
-            "user_id": "U1001",
-            "user_name": "Ada Lovelace",
-            "user_email": "ada@example.com",
-            "user_address": "1 Analytical Engine Way",
-        }
-    )
-    mocked.set_llm(
-        _ai_verify("U1001"),
-        _ai("Great, you're verified. What would you like to order?"),
-    )
-
-    reply = agent.run_agent("conv-2", "my id is U1001")
-
-    mocked.get_user.assert_called_once_with("U1001")
-    values = _state("conv-2").values
-    assert values.get("authorized") is True
-    assert values.get("user_id") == "U1001"
-    # Profile loaded from the users table at verification time.
-    assert values.get("profile_name") == "Ada Lovelace"
-    assert values.get("profile_email") == "ada@example.com"
-    assert values.get("profile_address") == "1 Analytical Engine Way"
-    assert reply
-    mocked.post.assert_not_called()
-
-
-# --- Scenario 3: interrupt fires before any POST ---------------------------
-
-
-def test_all_params_collected_interrupts_without_post(mocked):
-    mocked.set_llm(
-        _ai_verify("U1001"),
-        _ai("Thanks! I have your details."),  # after verify, collect
-        _ai_create_order(),  # once params gathered, request the order
-    )
-
-    # Turn 1: verify + authorize
-    agent.run_agent("conv-3", "id U1001", whatsapp_number="+15551230000")
-    # Turn 2: user provides params; agent emits create_order -> interrupt
-    reply = agent.run_agent("conv-3", "here are my details ...")
-
-    assert _state("conv-3").next  # paused on the confirm interrupt
-    # The confirm prompt shows the order summary and asks yes/no.
+    assert _state("conv-1").next  # paused on the confirm interrupt
+    assert "list the orders" in reply.lower()
+    assert "C1001" in reply  # the customer id is shown
     assert "yes or no" in reply.lower()
-    assert "here is your order" in reply.lower()
-    assert "Ada Lovelace" in reply  # order params appear in the summary
     mocked.post.assert_not_called()
     mocked.put_mapping.assert_not_called()
 
 
-# --- Scenario 4: resume 'yes' triggers POST + mapping ----------------------
+# --- Scenario (b): resume 'yes' triggers POST + mapping --------------------
 
 
 def test_resume_yes_triggers_post_and_mapping(mocked):
     mocked.set_llm(
-        _ai_verify("U1001"),
-        _ai("Thanks, verified."),
-        _ai_create_order(),
-        _ai("All done!"),
+        _ai("What's your customer id?"),
+        _ai_list_orders("C1001"),
+        _ai("All set!"),
     )
 
-    agent.run_agent("conv-4", "my id is U1001", whatsapp_number="+15551230000")
-    agent.run_agent("conv-4", "my details are ...")
+    agent.run_agent("conv-4", "hi", whatsapp_number="+15551230000")
+    agent.run_agent("conv-4", "it's C1001")
     mocked.post.assert_not_called()  # paused on interrupt, not run yet
 
     agent.run_agent("conv-4", "yes")
 
     mocked.post.assert_called_once()
     _, kwargs = mocked.post.call_args
-    body = kwargs["json"]
-    assert body["conversation_id"] == "conv-4"
+    # The body MUST be EXACTLY these two keys, with the state conversation_id.
+    assert kwargs["json"] == {"conversation_id": "conv-4", "customer_id": "C1001"}
     assert "Authorization" not in kwargs["headers"]
 
     # Workflow id is the RPA ``id`` field, coerced to a string. A whatsapp_number
     # was supplied, so the channel is recorded as "whatsapp".
     mocked.put_mapping.assert_called_once_with(
-        "conv-4", "237436573", "U1001", "+15551230000", "whatsapp"
+        "conv-4", "237436573", "C1001", "+15551230000", "whatsapp"
     )
 
 
 def test_resume_yes_api_channel_when_no_whatsapp_number(mocked):
     # No whatsapp_number (UI/API path) -> channel recorded as "api".
     mocked.set_llm(
-        _ai_verify("U1001"),
-        _ai("Thanks, verified."),
-        _ai_create_order(),
-        _ai("All done!"),
+        _ai("What's your customer id?"),
+        _ai_list_orders("C1001"),
+        _ai("All set!"),
     )
 
-    agent.run_agent("conv-api", "my id is U1001")  # no whatsapp_number
-    agent.run_agent("conv-api", "my details are ...")
+    agent.run_agent("conv-api", "hi")  # no whatsapp_number
+    agent.run_agent("conv-api", "C1001")
     agent.run_agent("conv-api", "yes")
 
     mocked.put_mapping.assert_called_once_with(
-        "conv-api", "237436573", "U1001", "", "api"
+        "conv-api", "237436573", "C1001", "", "api"
     )
 
 
-# --- Scenario 5: resume 'no' cancels, no POST ------------------------------
+# --- Scenario (c): resume 'no' cancels, no POST ----------------------------
 
 
 def test_resume_no_does_not_post(mocked):
     mocked.set_llm(
-        _ai_verify("U1001"),
-        _ai("Verified."),
-        _ai_create_order(),
+        _ai("What's your customer id?"),
+        _ai_list_orders("C1001"),
     )
 
-    agent.run_agent("conv-5", "id: U1001")
-    agent.run_agent("conv-5", "my details ...")
+    agent.run_agent("conv-5", "hi")
+    agent.run_agent("conv-5", "C1001")
     agent.run_agent("conv-5", "no")
 
     mocked.post.assert_not_called()
     mocked.put_mapping.assert_not_called()
 
 
-# --- Scenario 5b: ambiguous reply re-asks, then 'yes' places ---------------
+# --- Scenario (d): ambiguous reply re-asks, then 'yes' posts ---------------
 
 
 def test_ambiguous_confirm_reasks_then_yes_posts(mocked):
     mocked.set_llm(
-        _ai_verify("U1001"),
-        _ai("Verified."),
-        _ai_create_order(),
-        _ai("All done!"),
+        _ai("What's your customer id?"),
+        _ai_list_orders("C1001"),
+        _ai("All set!"),
     )
 
-    agent.run_agent("conv-5b", "id: U1001")
-    agent.run_agent("conv-5b", "my details ...")
+    agent.run_agent("conv-5b", "hi")
+    agent.run_agent("conv-5b", "C1001")
 
-    # An ambiguous reply should NOT cancel and NOT place — it re-asks.
+    # An ambiguous reply should NOT cancel and NOT run — it re-asks.
     reply = agent.run_agent("conv-5b", "hmm maybe")
     assert _state("conv-5b").next  # still paused on the confirm interrupt
     assert "yes" in reply.lower() and "no" in reply.lower()
     mocked.post.assert_not_called()
 
-    # A clear 'yes' now places the order.
+    # A clear 'yes' now runs the lookup.
     agent.run_agent("conv-5b", "yes")
     mocked.post.assert_called_once()
 
 
-# --- Scenario 6: create_order before verification is gated -----------------
+# --- Workflow id parsed from the RPA "id" field ----------------------------
 
 
-def test_create_order_before_verification_is_refused(mocked):
-    # The model (mis)behaves: it tries to order before verifying.
+def test_workflow_id_parsed_from_id_field(mocked):
     mocked.set_llm(
-        _ai_create_order(),
-        _ai("You need to verify first - what's your user ID?"),
+        _ai("What's your customer id?"),
+        _ai_list_orders("C1001"),
+        _ai("All set!"),
     )
 
-    agent.run_agent("conv-6", "just place an order for 3 widgets")
+    agent.run_agent("conv-id", "hi")
+    agent.run_agent("conv-id", "C1001")
+    agent.run_agent("conv-id", "yes")
 
-    # The gate blocked create_order: no POST, no mapping, not authorized.
-    assert _state("conv-6").values.get("authorized") is not True
-    mocked.post.assert_not_called()
-    mocked.put_mapping.assert_not_called()
+    # The RPA response ``id`` (237436573) is coerced to the string "237436573".
+    # put_mapping is called positionally (conversation_id, workflow_id,
+    # customer_id, whatsapp_number, channel).
+    _, workflow_id, _, _, _ = mocked.put_mapping.call_args.args
+    assert workflow_id == "237436573"
 
 
 # --- Extra: ORDER_API_KEY adds the bearer header ---------------------------
@@ -341,14 +252,13 @@ def test_create_order_before_verification_is_refused(mocked):
 def test_order_api_key_sets_authorization_header(mocked, monkeypatch):
     monkeypatch.setenv("ORDER_API_KEY", "secret-key")
     mocked.set_llm(
-        _ai_verify("U1001"),
-        _ai("Verified."),
-        _ai_create_order(),
-        _ai("All done!"),
+        _ai("What's your customer id?"),
+        _ai_list_orders("C1001"),
+        _ai("All set!"),
     )
 
-    agent.run_agent("conv-7", "my id is U1001")
-    agent.run_agent("conv-7", "details ...")
+    agent.run_agent("conv-7", "hi")
+    agent.run_agent("conv-7", "C1001")
     agent.run_agent("conv-7", "yes")
 
     _, kwargs = mocked.post.call_args

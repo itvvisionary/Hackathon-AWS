@@ -1,21 +1,18 @@
-"""Cross-feature integration test for the ordering flow.
+"""Cross-feature integration test for the order-lookup flow.
 
 Unlike tests/test_agent.py (which swaps in an InMemorySaver and mocks data.*),
 this exercises the real pieces wired together against moto-backed DynamoDB:
 
   * the real ``DynamoDBSaver`` persisting LangGraph state to the checkpointer
     table (so the interrupt survives between the two ``run_agent`` calls),
-  * the real ``data.*`` helpers reading the users table and writing the mapping
-    and chat-history tables,
+  * the real ``data.*`` helpers writing the mapping and chat-history tables,
   * the real LangGraph graph and HITL interrupt.
 
 Only the genuinely external boundaries are mocked: the Bedrock LLM (via
 ``agent._build_llm``) and the order endpoint (``requests.post``). The flow is:
-authorized id -> collect + confirm interrupt (no POST) -> resume "yes" -> POST,
-mapping write, and recorded chat turns.
+user provides a customer id -> confirm interrupt (no POST) -> resume "yes" ->
+POST with exactly {conversation_id, customer_id}, mapping write.
 """
-
-from unittest.mock import MagicMock
 
 import pytest
 from langchain_core.messages import AIMessage
@@ -23,30 +20,22 @@ from langchain_core.messages import AIMessage
 import agent
 import data
 from checkpointer import DynamoDBSaver
-from conftest import USERS_TABLE_NAME
 
 
-ORDER_ARGS = {
-    "user_name": "Ada Lovelace",
-    "user_email": "ada@example.com",
-    "user_address": "1 Analytical Engine Way",
-    "products": "Widgets",
-    "number_of_products": 3,
-    "conversation_id": "llm-supplied-ignored",
-}
+def _ai(text):
+    return AIMessage(content=text)
 
 
-def _ai_verify(user_id):
+def _ai_list_orders(customer_id):
     return AIMessage(
-        content="Checking that ID.",
-        tool_calls=[{"name": "verify_user", "args": {"user_id": user_id}, "id": "verify-1"}],
-    )
-
-
-def _ai_create_order():
-    return AIMessage(
-        content="Placing your order now.",
-        tool_calls=[{"name": "create_order", "args": dict(ORDER_ARGS), "id": "call-1"}],
+        content="Looking up your orders now.",
+        tool_calls=[
+            {
+                "name": "list_orders",
+                "args": {"customer_id": customer_id, "conversation_id": "ignored"},
+                "id": "call-1",
+            }
+        ],
     )
 
 
@@ -60,24 +49,17 @@ def _reset_data_cache():
     data._tables = {}
 
 
-def test_end_to_end_authorized_interrupt_resume_posts(
+def test_end_to_end_interrupt_resume_posts(
     dynamodb, monkeypatch, order_env, mock_requests_post
 ):
-    # Seed an authorized user in the real (moto) users table.
-    dynamodb.Table(USERS_TABLE_NAME).put_item(Item={"user_id": "U1001"})
-
     # Script the Bedrock LLM for the tool-driven flow:
-    #   turn 1: verify_user (-> authorized), then collect prompt;
-    #   turn 2: create_order (-> confirm interrupt);
+    #   turn 1: ask for the customer id;
+    #   turn 2: list_orders (-> confirm interrupt);
     #   after resume: wrap-up message.
-    # Build ONE scripted LLM reused on every _build_llm() call so responses
-    # advance across the tool loops (a fresh instance per call would replay
-    # verify_user forever and never terminate).
     scripted_llm = _ScriptedLLM(
         [
-            _ai_verify("U1001"),
-            AIMessage(content="You're verified. Share your order details."),
-            _ai_create_order(),
+            _ai("Welcome! What's your customer id?"),
+            _ai_list_orders("C1001"),
             AIMessage(content="All done!"),
         ]
     )
@@ -91,13 +73,13 @@ def test_end_to_end_authorized_interrupt_resume_posts(
     conversation_id = "conv-int-1"
     whatsapp_number = "+15551230000"
 
-    # Turn 1: natural-language id -> verify_user authorizes, agent asks for details.
-    agent.run_agent(conversation_id, "hi, my id is U1001", whatsapp_number=whatsapp_number)
+    # Turn 1: agent asks for the customer id.
+    agent.run_agent(conversation_id, "hi", whatsapp_number=whatsapp_number)
     mock_requests_post.assert_not_called()
 
-    # Turn 2: user supplies details -> create_order -> pauses on confirm interrupt.
-    reply = agent.run_agent(conversation_id, "here are my order details")
-    assert "confirm" in reply.lower()
+    # Turn 2: user supplies the id -> list_orders -> pauses on confirm interrupt.
+    reply = agent.run_agent(conversation_id, "my customer id is C1001")
+    assert "list the orders" in reply.lower()
     mock_requests_post.assert_not_called()
     assert data.get_mapping(conversation_id) is None
 
@@ -109,12 +91,16 @@ def test_end_to_end_authorized_interrupt_resume_posts(
 
     mock_requests_post.assert_called_once()
     _, kwargs = mock_requests_post.call_args
-    assert kwargs["json"]["conversation_id"] == conversation_id
+    # The POST body is EXACTLY these two keys with the state conversation_id.
+    assert kwargs["json"] == {
+        "conversation_id": conversation_id,
+        "customer_id": "C1001",
+    }
 
     mapping = data.get_mapping(conversation_id)
     assert mapping is not None
     assert mapping["workflow_id"] == "237436573"  # RPA id, coerced to string
-    assert mapping["user_id"] == "U1001"
+    assert mapping["customer_id"] == "C1001"
     assert mapping["whatsapp_number"] == whatsapp_number
     assert mapping["channel"] == "whatsapp"  # came in with a whatsapp_number
 

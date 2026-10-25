@@ -105,9 +105,22 @@ class AskRequest(BaseModel):
 
 
 class CallbackRequest(BaseModel):
+    """Order-list result from the RPA/SAP workflow.
+
+    Only ``conversation_id`` is required (matching is impossible without it).
+    Every per-order field is optional and defaults to ``[]`` so a missing field
+    does NOT 422. Each per-order field accepts either a list of strings OR a
+    single scalar/string (tolerated and wrapped into a one-element list during
+    composition).
+    """
+
     conversation_id: str
-    receipt_id: str
-    total_cost: object
+    customer_found: bool = False
+    Doc_dates: object = []
+    Sales_docs: object = []
+    Net_Prices: object = []
+    Currencies: object = []
+    Cust_Name: object = []
 
 
 # --- HTTP routes -----------------------------------------------------------
@@ -138,44 +151,90 @@ def ask(body: AskRequest):
     return {"reply": reply, "conversation_id": body.conversation_id}
 
 
+def _as_list(value):
+    """Normalize a callback field to a list of strings.
+
+    Accepts a list (coerce each cell to ``str``), a single scalar/string (wrap
+    into a one-element list), or ``None``/``""`` (treated as empty).
+    """
+    if value is None or value == "":
+        return []
+    if isinstance(value, (list, tuple)):
+        return [("" if cell is None else str(cell)) for cell in value]
+    return [str(value)]
+
+
+def _compose_order_message(workflow_id, body):
+    """Build the user-facing order-list message from the callback body.
+
+    Zips the five parallel per-order lists by index (using ``""`` for missing
+    cells) into one readable line per order. When the customer was not found or
+    every list is empty, returns the "no orders" message instead.
+    """
+    doc_dates = _as_list(body.Doc_dates)
+    sales_docs = _as_list(body.Sales_docs)
+    net_prices = _as_list(body.Net_Prices)
+    currencies = _as_list(body.Currencies)
+    cust_name = _as_list(body.Cust_Name)
+
+    columns = [doc_dates, sales_docs, net_prices, currencies, cust_name]
+    max_len = max((len(col) for col in columns), default=0)
+
+    if not body.customer_found or max_len == 0:
+        return f"No orders found for the requested customer (workflow {workflow_id})."
+
+    def cell(col, i):
+        return col[i] if i < len(col) else ""
+
+    lines = [f"Here are the orders for workflow {workflow_id}:"]
+    for i in range(max_len):
+        lines.append(
+            f"{i + 1}) Sales doc {cell(sales_docs, i)} | "
+            f"{cell(net_prices, i)} {cell(currencies, i)} | "
+            f"customer {cell(cust_name, i)} | date {cell(doc_dates, i)}"
+        )
+    return "\n".join(lines)
+
+
 @app.post("/callback")
 @log_io()
 def callback(body: CallbackRequest):
-    """Third-party workflow completion hook.
+    """Order-list workflow completion hook.
 
     The mapping table is keyed on ``conversation_id``; the callback is matched on
-    that alone. The stored ``workflow_id`` (recorded by create_order) is read
+    that alone. The stored ``workflow_id`` (recorded by list_orders) is read
     from the mapping and included in the completion message. On a match it
-    composes the receipt/total message, optionally pushes it to WhatsApp (only
-    when the origination phone number is configured and a mapping with a WhatsApp
+    composes the order-list message, optionally pushes it to WhatsApp (only when
+    the origination phone number is configured and a mapping with a WhatsApp
     number exists), and records the assistant turn. Never crashes when WhatsApp
     env/number is absent.
     """
     ep_id = set_endpoint_request_id()
     LOG.debug(
         "callback input: endpoint_request_id=%s conversation_id=%s "
-        "receipt_id=%s total_cost=%r",
+        "customer_found=%s Doc_dates=%r Sales_docs=%r Net_Prices=%r "
+        "Currencies=%r Cust_Name=%r",
         ep_id,
         body.conversation_id,
-        body.receipt_id,
-        body.total_cost,
+        body.customer_found,
+        body.Doc_dates,
+        body.Sales_docs,
+        body.Net_Prices,
+        body.Currencies,
+        body.Cust_Name,
     )
     mapping = data.get_mapping(body.conversation_id)
     LOG.debug("callback mapping lookup: %r", mapping)
 
-    # Match on conversation_id AND workflow_id. A missing mapping or a
-    # workflow_id that doesn't match the recorded one is rejected (404), so a
-    # callback for a different/stale workflow never messages the user.
+    # Match on conversation_id alone. A missing mapping is rejected (404), so a
+    # callback for an unknown conversation never messages anyone.
     if not mapping:
         LOG.warning("Callback for unknown conversation %s", body.conversation_id)
         raise HTTPException(status_code=404, detail="conversation not found")
 
-    # The workflow id was recorded by create_order; include it in the message.
+    # The workflow id was recorded by list_orders; include it in the message.
     workflow_id = mapping.get("workflow_id")
-    text = (
-        f"Here are the results for workflow {workflow_id}: "
-        f"Receipt {body.receipt_id}. Total cost {body.total_cost}."
-    )
+    text = _compose_order_message(workflow_id, body)
 
     # Route the completion by the channel recorded when the order was placed.
     # - "whatsapp": push the message to the user's WhatsApp number (gated on
@@ -246,7 +305,7 @@ def process_sqs_batch(event):
 
     Reuses the proven ``whatsapp`` extractors and the shared agent core. The
     conversation_id is the WhatsApp sender so the mapping write performed inside
-    ``create_order`` stores the phone number for later callbacks. Returns the
+    ``list_orders`` stores the phone number for later callbacks. Returns the
     ``batchItemFailures`` shape so SQS only retries the records that failed,
     mirroring handler.py.
     """

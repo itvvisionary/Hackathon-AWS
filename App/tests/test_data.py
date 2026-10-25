@@ -43,7 +43,7 @@ def test_put_and_get_mapping_round_trip(dynamodb):
     data.put_mapping(
         conversation_id="conv-9",
         workflow_id="wf-42",
-        user_id="u-123",
+        customer_id="C-123",
         whatsapp_number="+15551234567",
         channel="whatsapp",
     )
@@ -52,7 +52,7 @@ def test_put_and_get_mapping_round_trip(dynamodb):
     assert mapping == {
         "conversation_id": "conv-9",
         "workflow_id": "wf-42",
-        "user_id": "u-123",
+        "customer_id": "C-123",
         "whatsapp_number": "+15551234567",
         "channel": "whatsapp",
     }
