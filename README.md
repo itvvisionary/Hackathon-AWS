@@ -219,3 +219,9 @@ completion that triggers a WhatsApp message. It is disabled in prod.
 
 `lambda_log_level = "DEBUG"` (dev) logs every function's inputs and outputs,
 including customer names, emails and addresses. Prod uses `INFO`.
+
+---
+
+## License
+
+Released under the [MIT License](LICENSE).
